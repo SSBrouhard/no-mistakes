@@ -22,6 +22,52 @@ func TestExtractGrokPromptReadsManagedPromptFile(t *testing.T) {
 	}
 }
 
+func TestRunGrokAcceptsNoContextFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prompt.txt")
+	if err := os.WriteFile(path, []byte("review"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	t.Cleanup(func() { os.Stdout = oldStdout })
+
+	status := runGrok([]string{"--no-context-files", "--prompt-file", path, "--output-format", "streaming-messages-json"}, defaultScenario())
+	_ = w.Close()
+	var out bytes.Buffer
+	_, _ = out.ReadFrom(r)
+	if status != 0 {
+		t.Fatalf("runGrok() status = %d with --no-context-files", status)
+	}
+	if !strings.Contains(out.String(), `"type":"result"`) {
+		t.Fatalf("output missing result after --no-context-files:\n%s", out.String())
+	}
+}
+
+func TestRunGrokHelpAdvertisesNoContextFiles(t *testing.T) {
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	t.Cleanup(func() { os.Stdout = oldStdout })
+
+	status := runGrok([]string{"--help"}, defaultScenario())
+	_ = w.Close()
+	var out bytes.Buffer
+	_, _ = out.ReadFrom(r)
+	if status != 0 {
+		t.Fatalf("runGrok --help status = %d", status)
+	}
+	if !strings.Contains(out.String(), "--no-context-files") {
+		t.Fatalf("fakeagent grok --help must advertise --no-context-files:\n%s", out.String())
+	}
+}
+
 func TestRunGrokEmitsStreamingMessagesStructuredResult(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "prompt.txt")
 	if err := os.WriteFile(path, []byte("review"), 0o600); err != nil {

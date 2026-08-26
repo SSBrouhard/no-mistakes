@@ -8,6 +8,10 @@ import (
 )
 
 func runGrok(args []string, scenario *Scenario) int {
+	if grokWantsHelp(args) {
+		fmt.Print(grokFakeHelp)
+		return 0
+	}
 	prompt, err := extractGrokPrompt(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fakeagent: grok prompt: %v\n", err)
@@ -56,6 +60,24 @@ func runGrok(args []string, scenario *Scenario) int {
 		},
 	})
 	return 0
+}
+
+const grokFakeHelp = `Grok Build (fakeagent)
+
+Options:
+      --no-context-files
+          Skip repo AGENTS.md / CLAUDE.md / project rules
+      --prompt-file <PATH>
+          Single-turn prompt from a file
+`
+
+func grokWantsHelp(args []string) bool {
+	for _, arg := range args {
+		if arg == "--help" || arg == "-h" {
+			return true
+		}
+	}
+	return false
 }
 
 func extractGrokPrompt(args []string) (string, error) {

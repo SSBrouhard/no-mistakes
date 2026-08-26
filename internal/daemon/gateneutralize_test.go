@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -32,13 +35,69 @@ func TestNewPipelineAgent_OptOut_AdmitsVerifiedHarness(t *testing.T) {
 	}
 }
 
+func TestNewPipelineAgent_OptOut_AdmitsGrokWhenNoContextFilesAvailable(t *testing.T) {
+	bin := writeFakeGrokHelp(t, true)
+	cfg := &config.Config{
+		Agent:                  types.AgentGrok,
+		DisableProjectSettings: true,
+		AgentPathOverride:      map[string]string{"grok": bin},
+	}
+	ag, err := newPipelineAgent(context.Background(), cfg, t.TempDir(), fakeLookPath, runenv.Overlay{})
+	if err != nil {
+		t.Fatalf("grok with --no-context-files must pass under opt-out, got: %v", err)
+	}
+	if !agent.NeutralizesGateInstructions(ag) {
+		t.Error("grok pipeline agent must report neutralized when skip-flag support is in force")
+	}
+	_ = ag.Close()
+}
+
+func TestNewPipelineAgent_OptOut_RefusesGrokWhenNoContextFilesUnavailable(t *testing.T) {
+	bin := writeFakeGrokHelp(t, false)
+	cfg := &config.Config{
+		Agent:                  types.AgentGrok,
+		DisableProjectSettings: true,
+		AgentPathOverride:      map[string]string{"grok": bin},
+	}
+	if _, err := newPipelineAgent(context.Background(), cfg, t.TempDir(), fakeLookPath, runenv.Overlay{}); err == nil {
+		t.Fatal("grok without --no-context-files must be refused under opt-out")
+	} else if !strings.Contains(err.Error(), "does not neutralize") || !strings.Contains(err.Error(), "grok") {
+		t.Errorf("grok refusal should name the harness and reason, got: %v", err)
+	}
+}
+
+func writeFakeGrokHelp(t *testing.T, advertiseNoContextFiles bool) string {
+	t.Helper()
+	helpLine := "      --verbatim"
+	if advertiseNoContextFiles {
+		helpLine = "      --no-context-files"
+	}
+	name := "grok"
+	script := "#!/bin/sh\nprintf '%s\\n' 'Options:' '" + helpLine + "'\n"
+	if runtime.GOOS == "windows" {
+		name = "grok.cmd"
+		script = "@echo off\r\necho Options:\r\necho " + helpLine + "\r\n"
+	}
+	bin := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake grok: %v", err)
+	}
+	return bin
+}
+
 // TestNewPipelineAgent_OptOut_RefusesUnverifiedHarness is the captain-mandated
 // fail-closed contract at the daemon wiring: under the opt-out, a harness with no
 // verified neutralization knob is refused rather than launched with project
-// instructions loaded.
+// instructions loaded. Grok here is the nonexistent fakeLookPath binary, which
+// cannot advertise --no-context-files.
 func TestNewPipelineAgent_OptOut_RefusesUnverifiedHarness(t *testing.T) {
 	for _, name := range []types.AgentName{types.AgentGrok, types.AgentOpenCode, types.AgentCopilot} {
 		cfg := &config.Config{Agent: name, DisableProjectSettings: true}
+		if name == types.AgentGrok {
+			// AgentPathFor uses this path, not lookPath. Point at a missing
+			// binary so PATH grok cannot make this environment-dependent.
+			cfg.AgentPathOverride = map[string]string{"grok": "/fake/bin/grok"}
+		}
 		if _, err := newPipelineAgent(context.Background(), cfg, t.TempDir(), fakeLookPath, runenv.Overlay{}); err == nil {
 			t.Fatalf("%s must be refused under opt-out", name)
 		} else if !strings.Contains(err.Error(), "does not neutralize") || !strings.Contains(err.Error(), string(name)) {

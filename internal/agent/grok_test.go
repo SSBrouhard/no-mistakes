@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func TestGrokAgentBuildArgsUsesManagedHeadlessContractWithoutPinningModel(t *testing.T) {
@@ -33,6 +37,9 @@ func TestGrokAgentBuildArgsUsesManagedHeadlessContractWithoutPinningModel(t *tes
 			t.Errorf("args %v missing %s", args, want)
 		}
 	}
+	if grokArgsContain(args, "--no-context-files") {
+		t.Fatalf("opt-out grok without skip-flag support must not pass --no-context-files: %v", args)
+	}
 	for _, arg := range args {
 		if arg == "-m" || arg == "--model" || strings.HasPrefix(arg, "--model=") {
 			t.Fatalf("managed args must leave Grok's current default model unpinned: %v", args)
@@ -52,6 +59,47 @@ func TestGrokAgentBuildArgsPreservesExplicitModelOverrideAndResume(t *testing.T)
 	}
 	if grokArgsContain(args, "--system-prompt-override") {
 		t.Fatalf("project instruction override must be opt-in policy only: %v", args)
+	}
+	if grokArgsContain(args, "--no-context-files") {
+		t.Fatalf("default grok invocation must not pass --no-context-files: %v", args)
+	}
+}
+
+func TestGrokAgentBuildArgsOptOutAddsNoContextFilesWhenSupported(t *testing.T) {
+	a := &grokAgent{bin: "grok", disableProjectSettings: true, supportsNoContextFiles: true}
+	args := a.buildArgs("/tmp/prompt.txt", nil, "")
+	if !grokArgsContain(args, "--no-context-files") {
+		t.Fatalf("opt-out grok with skip-flag support must pass --no-context-files: %v", args)
+	}
+	if !grokArgsContainPair(args, "--system-prompt-override", grokGateSystemPrompt) {
+		t.Fatalf("opt-out grok must keep system-prompt replacement as defense in depth: %v", args)
+	}
+}
+
+func TestGrokAgentBuildArgsDoesNotAddNoContextFilesWithoutOptOut(t *testing.T) {
+	a := &grokAgent{bin: "grok", supportsNoContextFiles: true}
+	args := a.buildArgs("/tmp/prompt.txt", nil, "")
+	if grokArgsContain(args, "--no-context-files") {
+		t.Fatalf("grok without disable_project_settings must keep loading project files: %v", args)
+	}
+}
+
+func TestGrokAgentBuildArgsOptOutDoesNotDuplicateNoContextFiles(t *testing.T) {
+	a := &grokAgent{
+		bin:                    "grok",
+		extraArgs:              []string{"--no-context-files", "--model", "operator-selected"},
+		disableProjectSettings: true,
+		supportsNoContextFiles: true,
+	}
+	args := a.buildArgs("/tmp/prompt.txt", nil, "")
+	count := 0
+	for _, arg := range args {
+		if arg == "--no-context-files" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("opt-out grok must not duplicate a pinned --no-context-files: %v", args)
 	}
 }
 
@@ -139,12 +187,15 @@ func TestGrokHTTP402Helper(t *testing.T) {
 	os.Exit(1)
 }
 
-func TestGrokAgentNeutralizationFailsClosedUntilEmpiricallyVerified(t *testing.T) {
+func TestGrokAgentNeutralizesOnlyWhenSkipFlagIsInForce(t *testing.T) {
 	if (&grokAgent{disableProjectSettings: true}).NeutralizesGateInstructions() {
-		t.Fatal("system prompt replacement is not enough to claim complete project-setting isolation")
+		t.Fatal("system prompt replacement is not enough to claim isolation when --no-context-files is unavailable")
 	}
-	if (&grokAgent{}).NeutralizesGateInstructions() {
+	if (&grokAgent{supportsNoContextFiles: true}).NeutralizesGateInstructions() {
 		t.Fatal("agent without the trusted opt-out must not claim neutralization")
+	}
+	if !(&grokAgent{disableProjectSettings: true, supportsNoContextFiles: true}).NeutralizesGateInstructions() {
+		t.Fatal("opt-out grok that will pass --no-context-files must report neutralized")
 	}
 	for _, args := range [][]string{
 		{"--system-prompt-override", "operator prompt"},
@@ -154,9 +205,109 @@ func TestGrokAgentNeutralizationFailsClosedUntilEmpiricallyVerified(t *testing.T
 		{"--append-system-prompt=operator rules"},
 	} {
 		if (&grokAgent{disableProjectSettings: true, extraArgs: args}).NeutralizesGateInstructions() {
-			t.Fatalf("override %v must defeat the neutralization claim", args)
+			t.Fatalf("override %v must not claim isolation when the skip flag cannot be used", args)
 		}
 	}
+}
+
+func TestGrokHelpAdvertisesNoContextFiles(t *testing.T) {
+	if grokHelpAdvertisesNoContextFiles("") {
+		t.Fatal("empty help must not advertise --no-context-files")
+	}
+	if grokHelpAdvertisesNoContextFiles("      --verbatim\n      --no-subagents\n") {
+		t.Fatal("official grok help without the skip flag must not advertise it")
+	}
+	if grokHelpAdvertisesNoContextFiles("skip repo no-context-files accidentally") {
+		t.Fatal("bare mention without the flag token must not count")
+	}
+	help := "      --no-context-files\n          Skip repo AGENTS.md / CLAUDE.md / project rules\n"
+	if !grokHelpAdvertisesNoContextFiles(help) {
+		t.Fatal("clap-style --no-context-files help must advertise skip support")
+	}
+}
+
+func TestNewWithOptions_GrokNeutralizesWhenCLIAdvertisesNoContextFiles(t *testing.T) {
+	bin := writeFakeGrok(t, t.TempDir(), true)
+	created, err := NewWithOptions(types.AgentGrok, bin, nil, Options{DisableProjectSettings: true})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	if !NeutralizesGateInstructions(created) {
+		t.Fatal("opt-out grok whose --help lists --no-context-files must neutralize")
+	}
+	if err := EnsureGateNeutralized(created); err != nil {
+		t.Fatalf("gate must admit grok with skip-flag support: %v", err)
+	}
+}
+
+func TestNewWithOptions_GrokDoesNotNeutralizeWhenCLIOmitsNoContextFiles(t *testing.T) {
+	bin := writeFakeGrok(t, t.TempDir(), false)
+	created, err := NewWithOptions(types.AgentGrok, bin, nil, Options{DisableProjectSettings: true})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	if NeutralizesGateInstructions(created) {
+		t.Fatal("opt-out grok without --no-context-files must not claim isolation")
+	}
+	if err := EnsureGateNeutralized(created); err == nil {
+		t.Fatal("gate must refuse grok when the skip flag cannot be used")
+	}
+}
+
+func TestNewWithOptions_GrokDoesNotNeutralizeWhenBinaryMissing(t *testing.T) {
+	created, err := NewWithOptions(types.AgentGrok, filepath.Join(t.TempDir(), "missing-grok"), nil, Options{DisableProjectSettings: true})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	if NeutralizesGateInstructions(created) {
+		t.Fatal("missing grok binary must not claim skip-flag isolation")
+	}
+}
+
+func TestGrokAgent_RunOptOutPassesNoContextFilesToCLI(t *testing.T) {
+	workDir := t.TempDir()
+	bin := writeFakeGrok(t, t.TempDir(), true)
+	a := &grokAgent{bin: bin, disableProjectSettings: true, supportsNoContextFiles: true}
+	if _, err := a.Run(context.Background(), RunOpts{Prompt: "review", CWD: workDir}); err != nil {
+		t.Fatalf("run grok: %v", err)
+	}
+	argv, err := os.ReadFile(filepath.Join(workDir, "grok-argv.txt"))
+	if err != nil {
+		t.Fatalf("read captured grok argv: %v", err)
+	}
+	got := strings.TrimSpace(string(argv))
+	if !strings.Contains(got, "--no-context-files") {
+		t.Fatalf("grok argv = %q, want --no-context-files", got)
+	}
+	if !strings.Contains(got, "--verbatim") || !strings.Contains(got, "--no-subagents") {
+		t.Fatalf("grok argv = %q, want managed headless flags", got)
+	}
+}
+
+func writeFakeGrok(t *testing.T, dir string, advertiseNoContextFiles bool) string {
+	t.Helper()
+	helpLine := "      --verbatim"
+	if advertiseNoContextFiles {
+		helpLine = "      --no-context-files"
+	}
+	name := "grok"
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  printf '%%s\n' 'Options:' '%s' '          Skip repo AGENTS.md / CLAUDE.md / project rules'
+  exit 0
+fi
+printf '%%s\n' "$*" > grok-argv.txt
+printf '%%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
+`, helpLine)
+	if runtime.GOOS == "windows" {
+		name = "grok.cmd"
+		script = fmt.Sprintf("@echo off\r\nif \"%%~1\"==\"--help\" (\r\n  echo Options:\r\n  echo %s\r\n  echo           Skip repo AGENTS.md\r\n  exit /b 0\r\n)\r\necho %%* > grok-argv.txt\r\necho {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}\r\n", helpLine)
+	}
+	bin := filepath.Join(dir, name)
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake grok: %v", err)
+	}
+	return bin
 }
 
 func TestParseGrokEventsStructuredSuccess(t *testing.T) {

@@ -18,12 +18,21 @@ func optOutAgent(t *testing.T, name types.AgentName, extraArgs []string) Agent {
 	return a
 }
 
+func stubGrokHelp(t *testing.T, help string) {
+	t.Helper()
+	orig := grokHelpOutput
+	grokHelpOutput = func(string) (string, error) { return help, nil }
+	t.Cleanup(func() { grokHelpOutput = orig })
+}
+
 // TestNeutralizesGateInstructions_OnlyVerifiedHarnessesUnderOptOut is the core
-// fail-closed contract: under the opt-out, only codex, claude, and pi (whose
-// suppression knobs are empirically verified) neutralize the target repo's
-// project agent settings/instructions; every other harness reports false and is
-// refused rather than launched with project instructions loaded.
+// fail-closed contract: under the opt-out, only harnesses whose suppression
+// knobs are empirically verified neutralize the target repo's project agent
+// settings/instructions; every other harness reports false and is refused
+// rather than launched with project instructions loaded. Grok is unverified
+// here because this stub models a CLI without --no-context-files.
 func TestNeutralizesGateInstructions_OnlyVerifiedHarnessesUnderOptOut(t *testing.T) {
+	stubGrokHelp(t, "      --verbatim\n      --no-subagents\n")
 	for _, name := range []types.AgentName{types.AgentCodex, types.AgentClaude, types.AgentPi} {
 		if !NeutralizesGateInstructions(optOutAgent(t, name, nil)) {
 			t.Errorf("%s must neutralize under the opt-out with its default knob", name)
@@ -68,6 +77,7 @@ func TestNeutralizesGateInstructions_FalseWithoutOptOut(t *testing.T) {
 // TestEnsureGateNeutralized_RefusesUnsupportedUnderOptOut proves the gate fails
 // closed for an unsupported harness and admits codex, claude, and pi.
 func TestEnsureGateNeutralized_RefusesUnsupportedUnderOptOut(t *testing.T) {
+	stubGrokHelp(t, "      --verbatim\n      --no-subagents\n")
 	if err := EnsureGateNeutralized(optOutAgent(t, types.AgentCodex, nil)); err != nil {
 		t.Errorf("codex must pass the gate under opt-out: %v", err)
 	}
@@ -78,7 +88,7 @@ func TestEnsureGateNeutralized_RefusesUnsupportedUnderOptOut(t *testing.T) {
 		t.Errorf("pi must pass the gate under opt-out: %v", err)
 	}
 	if err := EnsureGateNeutralized(optOutAgent(t, types.AgentGrok, nil)); err == nil {
-		t.Error("grok must remain refused until project-setting isolation is empirically verified")
+		t.Error("grok must remain refused until --no-context-files is available")
 	}
 	err := EnsureGateNeutralized(optOutAgent(t, types.AgentOpenCode, nil))
 	if err == nil {
@@ -151,5 +161,18 @@ func TestNeutralizesGateInstructions_HonestOnEffectiveOverride(t *testing.T) {
 	}
 	if !NeutralizesGateInstructions(optOutAgent(t, types.AgentPi, []string{"-nc"})) {
 		t.Error("pi with an explicit -nc must stay neutralized")
+	}
+}
+
+func TestNeutralizesGateInstructions_GrokWithNoContextFiles(t *testing.T) {
+	stubGrokHelp(t, "      --no-context-files\n          Skip repo AGENTS.md / CLAUDE.md / project rules\n")
+	if !NeutralizesGateInstructions(optOutAgent(t, types.AgentGrok, nil)) {
+		t.Error("grok whose CLI advertises --no-context-files must neutralize under the opt-out")
+	}
+	if err := EnsureGateNeutralized(optOutAgent(t, types.AgentGrok, nil)); err != nil {
+		t.Errorf("grok with skip-flag support must pass the gate: %v", err)
+	}
+	if !NeutralizesGateInstructions(optOutAgent(t, types.AgentGrok, []string{"--no-context-files"})) {
+		t.Error("grok with an explicit --no-context-files must stay neutralized")
 	}
 }

@@ -273,7 +273,7 @@ That resume command has a narrower flag surface than `codex exec`, so a resume t
 
 Spawns a `grok` subprocess for each invocation using a permission-restricted prompt file and `--output-format streaming-messages-json`. Native structured output is requested with `--json-schema`; the terminal `structured_output`, session identity, model, and usage fields are read from the Messages-compatible result event. Review-loop reuse resumes the reported Grok session with `--resume`.
 Without an explicit pin, Grok uses its current configured default model. See [`agent_config`](/no-mistakes/reference/global-config/#agent_config) for model and effort configuration and native mapping.
-Grok is not available to a repository with `disable_project_settings: true`, because Grok 1.0.5 still discovers native project instructions and `.grok` project surfaces; the gate fails closed before launch. See [`disable_project_settings`](/no-mistakes/reference/repo-config/#disable_project_settings) for the security boundary. System-prompt, alternate-agent, working-directory, worktree, and restore flags are reserved so global overrides cannot redirect the managed invocation.
+A repository with `disable_project_settings: true` can use Grok only when the installed CLI advertises `--no-context-files`, which skips repo `AGENTS.md` / `CLAUDE.md` / project rules. Official Grok 1.0.10 does not have that flag, so the gate fails closed before launch rather than passing an unknown argument. See [`disable_project_settings`](/no-mistakes/reference/repo-config/#disable_project_settings) for the security boundary. System-prompt, alternate-agent, working-directory, worktree, and restore flags are reserved so global overrides cannot redirect the managed invocation.
 
 ## Antigravity
 

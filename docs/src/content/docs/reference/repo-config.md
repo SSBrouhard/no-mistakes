@@ -145,8 +145,8 @@ Suppress project-level agent settings and instructions for every gate-agent star
 
 This opt-in is intended for agent-orchestration repositories whose `AGENTS.md`, `CLAUDE.md`, or harness-specific project settings would give a validation agent an operator identity and authority that it must not adopt.
 When enabled, no-mistakes suppresses the target checkout's project settings for every agent-driven gate step while preserving user-level agent configuration.
-Codex, Claude, and Pi are the currently verified agents: Codex receives `project_doc_max_bytes=0` and `--ignore-rules`, Claude loads only its user setting source, and Pi runs with `--no-context-files` (preserving a pinned `--no-context-files` or `-nc` spelling).
-Grok 1.0.5 still discovers native project instructions and `.grok` project surfaces, so it is not a verified agent for this boundary. A configuration that resolves Grok while this option is enabled therefore fails closed before launch.
+Codex, Claude, Pi, and Grok (when `--no-context-files` is available) are the currently verified agents: Codex receives `project_doc_max_bytes=0` and `--ignore-rules`, Claude loads only its user setting source, Pi runs with `--no-context-files` (preserving a pinned `--no-context-files` or `-nc` spelling), and Grok runs with `--no-context-files` only when the installed CLI advertises that flag.
+Official Grok without `--no-context-files` still discovers native project instructions and `.grok` project surfaces, so it is not a verified agent for this boundary. A configuration that resolves that Grok while this option is enabled therefore fails closed before launch rather than passing an unknown flag.
 The setting applies to both new and resumed sessions.
 
 The gate fails before launching an agent if any resolved agent or fallback lacks a verified suppression mechanism.
