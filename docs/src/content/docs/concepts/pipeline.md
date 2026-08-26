@@ -38,9 +38,9 @@ The pipeline is opinionated so that "passed the gate" has a stable meaning:
 | 1 | **Intent** | Use supplied intent or infer it from recent local agent transcripts | n/a |
 | 2 | **Rebase** | Fetch fresh remote upstream and the configured branch target, then rebase your branch onto them | `3` |
 | 3 | **Review** | AI code review of your diff | `0` (requires approval) |
-| 4 | **Test** | Run baseline tests and gather evidence for available intent | `3` |
+| 4 | **Test** | Targeted local validation of the change and intent (not a full CI suite), plus evidence when intent is available | `3` |
 | 5 | **Document** | Update docs when needed and report unresolved gaps | initial pass |
-| 6 | **Lint** | Run lint/static analysis | `3` |
+| 6 | **Lint** | Run lint/static analysis; shares the document step's initial housekeeping pass when no lint command is configured | `3` |
 | 7 | **Push** | Safely push the validated branch to the configured target | n/a |
 | 8 | **PR** | Create or update the pull request | n/a |
 | 9 | **CI** | Watch CI + mergeability, auto-fix failures | `3` |
@@ -52,10 +52,11 @@ The pipeline is opinionated so that "passed the gate" has a stable meaning:
   It also stops when the branch would silently bundle commits from a local default branch that were never pushed to `origin/<default_branch>`.
   If there's no diff left after the rebase, the pipeline skips the rest.
 - **Review before test** so the agent reads fresh code, not code it may have touched during fixes.
+  A later run's initial review also receives fix-round provenance for any uncertified pipeline-authored commits left on the branch when a previous run's re-review did not complete.
 - **Document after test** so docs are updated against code that's known to work.
 - **Lint last among local checks** so it doesn't churn over code that may still change.
 - **Push → PR → CI** happens after all local checks pass.
-  The push and CI auto-fix paths refuse to overwrite commits that reached the configured push target out of band.
+  A CI repair restarts the pipeline at Review, so the repaired commit passes the local checks before the Push step publishes it through the same overwrite protection.
   CI is the only step that talks to the outside world for validation.
 
 ## What each step can do
@@ -64,7 +65,7 @@ Every step can:
 
 - **Complete** cleanly and advance the pipeline.
 - **Return findings** with severity (`error`, `warning`, `info`) and an action (`auto-fix`, `ask-user`, `no-op`).
-- **Trigger auto-fix** if the step's `auto_fix` limit is above 0, the step result is auto-fixable, and any finding is `auto-fix`-eligible. Document and empty-command lint can instead apply safe fixes during their initial pass and report only unresolved findings.
+- **Trigger auto-fix** if the step's `auto_fix` limit is above 0, the step result is auto-fixable, and any finding is `auto-fix`-eligible. The document step applies safe documentation fixes during its initial pass and, when `commands.lint` is empty, combines that pass with initial safe lint fixes before the lint step consumes its findings.
 - **Pause for approval** if blocking findings remain after auto-fix, or if any finding is `ask-user`.
 - **Skip** when there's nothing to do (e.g., no diff, unsupported host).
 - **Fail** on fatal errors and stop the pipeline.
@@ -76,8 +77,8 @@ See [Auto-Fix Loop](/no-mistakes/concepts/auto-fix/) for how the fix cycle works
 You can't reorder steps. You *can*:
 
 - Swap the agent, or configure an ordered fallback list, globally or per-repo.
-- Set explicit `commands.test`, `commands.lint`, `commands.format`.
-- Store test evidence locally by default or opt into committed in-repo evidence with `test.evidence.store_in_repo`.
+- Set explicit `commands.lint`, `commands.format`, and an optional **targeted** `commands.test` (local intent validation only; not a full CI suite).
+- Store test evidence locally by default or, on a supported provider, opt into publishing it to an orphan evidence branch with `test.evidence.store_in_repo`.
 - Control auto-fix limits per step.
 - Ignore paths during review and documentation checks.
 - Disable or tune transcript-based intent extraction when intent is not supplied directly.

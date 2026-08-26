@@ -3,6 +3,7 @@ package types
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -13,10 +14,79 @@ const (
 	ActionAskUser = "ask-user"
 )
 
+// Finding severity constants: the vocabulary the review prompt instructs
+// agents to use, ordered most to least severe.
+const (
+	FindingSeverityError   = "error"
+	FindingSeverityWarning = "warning"
+	FindingSeverityInfo    = "info"
+)
+
+// This package owns the finding severity and action vocabularies. Callers that
+// accept a severity or action from outside a pipeline agent - a hand-written
+// eval miss, an IPC payload - validate against these rather than keeping their
+// own copy of the list.
+var (
+	knownFindingSeverities = []string{FindingSeverityError, FindingSeverityWarning, FindingSeverityInfo}
+	knownFindingActions    = []string{ActionAutoFix, ActionAskUser, ActionNoOp}
+)
+
+// NormalizeFindingSeverity trims and lower-cases one severity so equivalent
+// spellings compare equal. It does not check membership; see
+// IsKnownFindingSeverity.
+func NormalizeFindingSeverity(severity string) string {
+	return strings.ToLower(strings.TrimSpace(severity))
+}
+
+// NormalizeFindingAction trims and lower-cases one action. It does not check
+// membership; see IsKnownFindingAction.
+func NormalizeFindingAction(action string) string {
+	return strings.ToLower(strings.TrimSpace(action))
+}
+
+// IsKnownFindingSeverity reports whether severity, once normalized, is part of
+// the review severity vocabulary.
+func IsKnownFindingSeverity(severity string) bool {
+	return slices.Contains(knownFindingSeverities, NormalizeFindingSeverity(severity))
+}
+
+// IsKnownFindingAction reports whether action, once normalized, is part of the
+// finding action vocabulary.
+func IsKnownFindingAction(action string) bool {
+	return slices.Contains(knownFindingActions, NormalizeFindingAction(action))
+}
+
+// KnownFindingSeverities returns the severity vocabulary, for error messages
+// that have to name what they accept.
+func KnownFindingSeverities() []string { return slices.Clone(knownFindingSeverities) }
+
+// KnownFindingActions returns the action vocabulary, for error messages that
+// have to name what they accept.
+func KnownFindingActions() []string { return slices.Clone(knownFindingActions) }
+
 // Finding source constants. An empty Source is treated as agent-produced.
 const (
 	FindingSourceAgent = "agent"
 	FindingSourceUser  = "user"
+)
+
+const (
+	FindingReviewScopeSource                = "source"
+	FindingReviewScopePipelineOwnedDelivery = "pipeline-owned-delivery"
+	FindingReviewScopeExternalDelivery      = "external-delivery"
+)
+
+const (
+	FindingsRiskScopeSourceOrExternal      = "source-or-external"
+	FindingsRiskScopePipelineOwnedDelivery = "pipeline-owned-delivery"
+)
+
+// Finding category constants for the combined document+lint housekeeping
+// pass. An empty Category on a housekeeping finding is treated as
+// documentation (the stricter gate).
+const (
+	FindingCategoryDocumentation = "documentation"
+	FindingCategoryLint          = "lint"
 )
 
 // Finding represents a single review, test, lint, or PR comment finding.
@@ -29,6 +99,10 @@ type Finding struct {
 	Action           string `json:"action"`
 	Source           string `json:"source,omitempty"`
 	UserInstructions string `json:"user_instructions,omitempty"`
+	ReviewScope      string `json:"review_scope,omitempty"`
+	// Category separates the combined document+lint housekeeping pass's
+	// findings into their owning gates. Empty everywhere else.
+	Category string `json:"category,omitempty"`
 }
 
 // TestArtifact describes evidence produced by the test step for human review.
@@ -49,6 +123,8 @@ type findingWire struct {
 	Action              string `json:"action"`
 	Source              string `json:"source,omitempty"`
 	UserInstructions    string `json:"user_instructions,omitempty"`
+	ReviewScope         string `json:"review_scope,omitempty"`
+	Category            string `json:"category,omitempty"`
 	RequiresHumanReview *bool  `json:"requires_human_review,omitempty"`
 }
 
@@ -61,6 +137,7 @@ type Findings struct {
 	Artifacts      []TestArtifact `json:"artifacts,omitempty"`
 	RiskLevel      string         `json:"risk_level"`
 	RiskRationale  string         `json:"risk_rationale"`
+	RiskScope      string         `json:"risk_scope,omitempty"`
 }
 
 type findingsWire struct {
@@ -72,6 +149,7 @@ type findingsWire struct {
 	Artifacts      []TestArtifact `json:"artifacts"`
 	RiskLevel      string         `json:"risk_level"`
 	RiskRationale  string         `json:"risk_rationale"`
+	RiskScope      string         `json:"risk_scope"`
 }
 
 // ParseFindingsJSON decodes findings JSON, accepting current and legacy item
@@ -85,7 +163,7 @@ func ParseFindingsJSON(raw string) (Findings, error) {
 	if len(items) == 0 && len(wire.Legacy) > 0 {
 		items = wire.Legacy
 	}
-	return Findings{Items: items, Summary: wire.Summary, Tested: wire.Tested, TestingSummary: wire.TestingSummary, Artifacts: wire.Artifacts, RiskLevel: wire.RiskLevel, RiskRationale: wire.RiskRationale}, nil
+	return Findings{Items: items, Summary: wire.Summary, Tested: wire.Tested, TestingSummary: wire.TestingSummary, Artifacts: wire.Artifacts, RiskLevel: wire.RiskLevel, RiskRationale: wire.RiskRationale, RiskScope: wire.RiskScope}, nil
 }
 
 // NormalizeFindings assigns deterministic IDs to findings that do not have one yet.
@@ -108,7 +186,7 @@ func FilterFindings(findings Findings, ids []string) Findings {
 	for _, id := range ids {
 		selected[id] = true
 	}
-	filtered := Findings{Summary: findings.Summary, Tested: findings.Tested, TestingSummary: findings.TestingSummary, Artifacts: findings.Artifacts, RiskLevel: findings.RiskLevel, RiskRationale: findings.RiskRationale}
+	filtered := Findings{Summary: findings.Summary, Tested: findings.Tested, TestingSummary: findings.TestingSummary, Artifacts: findings.Artifacts, RiskLevel: findings.RiskLevel, RiskRationale: findings.RiskRationale, RiskScope: findings.RiskScope}
 	for _, item := range findings.Items {
 		if selected[item.ID] {
 			filtered.Items = append(filtered.Items, item)
@@ -129,7 +207,7 @@ func ExcludeFindings(findings Findings, ids []string) Findings {
 	for _, id := range ids {
 		excluded[id] = true
 	}
-	result := Findings{Summary: findings.Summary, Tested: findings.Tested, TestingSummary: findings.TestingSummary, Artifacts: findings.Artifacts, RiskLevel: findings.RiskLevel, RiskRationale: findings.RiskRationale}
+	result := Findings{Summary: findings.Summary, Tested: findings.Tested, TestingSummary: findings.TestingSummary, Artifacts: findings.Artifacts, RiskLevel: findings.RiskLevel, RiskRationale: findings.RiskRationale, RiskScope: findings.RiskScope}
 	for _, item := range findings.Items {
 		if !excluded[item.ID] {
 			result.Items = append(result.Items, item)
@@ -142,9 +220,9 @@ func ExcludeFindings(findings Findings, ids []string) Findings {
 // Action is "auto-fix". These are safe for automatic fixing without
 // user involvement.
 func AutoFixableFindings(findings Findings) Findings {
-	result := Findings{Summary: findings.Summary, Tested: findings.Tested, TestingSummary: findings.TestingSummary, Artifacts: findings.Artifacts, RiskLevel: findings.RiskLevel, RiskRationale: findings.RiskRationale}
+	result := Findings{Summary: findings.Summary, Tested: findings.Tested, TestingSummary: findings.TestingSummary, Artifacts: findings.Artifacts, RiskLevel: findings.RiskLevel, RiskRationale: findings.RiskRationale, RiskScope: findings.RiskScope}
 	for _, item := range findings.Items {
-		if item.actionOrDefault() == ActionAutoFix {
+		if item.ActionOrDefault() == ActionAutoFix {
 			result.Items = append(result.Items, item)
 		}
 	}
@@ -163,6 +241,7 @@ func MergeUserOverrides(findings Findings, instructions map[string]string, added
 		Artifacts:      findings.Artifacts,
 		RiskLevel:      findings.RiskLevel,
 		RiskRationale:  findings.RiskRationale,
+		RiskScope:      findings.RiskScope,
 	}
 	if len(findings.Items) > 0 {
 		result.Items = make([]Finding, len(findings.Items))
@@ -200,10 +279,14 @@ func MergeUserOverrides(findings Findings, instructions map[string]string, added
 	return result
 }
 
-// HasAskUserFindings returns true if any finding has Action "ask-user".
+// HasAskUserFindings returns true if any finding has an effective action of
+// "ask-user". It uses ActionOrDefault so an empty/missing action (which now
+// defaults to ask-user) parks for a human, keeping this in agreement with
+// AutoFixableFindings: an unclassified finding is never auto-fixed and is
+// always caught here as ask-user.
 func HasAskUserFindings(findings Findings) bool {
 	for _, item := range findings.Items {
-		if item.Action == ActionAskUser {
+		if item.ActionOrDefault() == ActionAskUser {
 			return true
 		}
 	}
@@ -218,7 +301,7 @@ func HasAskUserFindings(findings Findings) bool {
 // accept the step as-is.
 func HasActionableFindings(findings Findings) bool {
 	for _, item := range findings.Items {
-		if item.actionOrDefault() != ActionNoOp {
+		if item.ActionOrDefault() != ActionNoOp {
 			return true
 		}
 	}
@@ -303,6 +386,8 @@ func (f *Finding) UnmarshalJSON(data []byte) error {
 	f.Action = wire.Action
 	f.Source = wire.Source
 	f.UserInstructions = wire.UserInstructions
+	f.ReviewScope = wire.ReviewScope
+	f.Category = wire.Category
 	if f.Action == "" && wire.RequiresHumanReview != nil {
 		if *wire.RequiresHumanReview {
 			f.Action = ActionAskUser
@@ -313,9 +398,17 @@ func (f *Finding) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (f Finding) actionOrDefault() string {
+// ActionOrDefault resolves a finding's effective action, defaulting an
+// empty/missing action to ask-user (park), not auto-fix. This closes a
+// fail-open hole: an unclassified finding on a non-schema path (a legacy
+// requires_human_review omission, an IPC- or user-supplied finding) must
+// route to a human rather than be silently auto-applied. It also matches the
+// review prompt's own "When in doubt, default to ask-user" instruction.
+// (MergeUserOverrides still stamps user-*added* findings auto-fix explicitly -
+// a user who hand-adds a finding is asking for a fix.)
+func (f Finding) ActionOrDefault() string {
 	if f.Action == "" {
-		return ActionAutoFix
+		return ActionAskUser
 	}
 	return f.Action
 }

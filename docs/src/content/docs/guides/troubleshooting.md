@@ -57,9 +57,22 @@ If the PID file points at a process that's no longer running, remove it and run 
 
 ### "a no-mistakes daemon is already running for this NM_HOME"
 
-The daemon holds an exclusive OS lock on `~/.no-mistakes/daemon.lock` for its whole lifetime, so a second daemon for the same root refuses to start instead of stealing the first one's socket.
-The OS releases the lock automatically when the holder exits or crashes, even on SIGKILL, so it cannot go stale: this error always means a genuinely live daemon, and the message includes the holder's PID and start time when available.
+This error always means a genuinely live daemon: the lock it reports cannot go stale (see [Daemon & Worktrees](/no-mistakes/concepts/daemon/) for the singleton-lock model).
 Manage that daemon with `no-mistakes daemon status` and `no-mistakes daemon stop` instead of deleting the lock file - deleting the file does not release the lock and only weakens the guard.
+
+If the socket exists and the process is running but stuck or unresponsive, `no-mistakes` bounds the connection wait with [`daemon_connect_timeout`](/no-mistakes/reference/global-config/#daemon_connect_timeout) and fails fast with an error naming the socket path instead of silently starting a second daemon. Restart the stuck daemon:
+
+```sh
+no-mistakes daemon stop
+no-mistakes daemon start
+```
+
+If the socket file exists but nothing answers at all (a dead socket left behind by an unclean exit, e.g. a crash or `SIGKILL`), commands that ensure the daemon is running (`no-mistakes`, `init`, `attach`, `rerun`, `axi run`, `axi respond`) now fail fast with a `connect to daemon socket` error instead of silently starting a replacement daemon. The error message itself includes a `(run 'no-mistakes daemon start' to recover)` hint - run `no-mistakes daemon start` directly to recover, since it self-heals past a dead socket and starts a fresh daemon.
+
+### "configured worktree placement is unusable"
+
+The daemon refuses to start while any [`worktree_roots`](/no-mistakes/reference/global-config/#worktree_roots) entry names a directory it cannot create run worktrees in, and `~/.no-mistakes/logs/daemon.log` names the offending entry.
+Because every command starts the daemon, that takes the whole CLI down until the entry is fixed: point it at a directory outside `NM_HOME` and outside every gated checkout, or remove it, then run `no-mistakes daemon start`.
 
 ### Managed service logs
 
@@ -71,26 +84,32 @@ Manage that daemon with `no-mistakes daemon status` and `no-mistakes daemon stop
 
 If you have multiple installs with different `NM_HOME` roots, each gets its own scoped service name (with a short suffix derived from the path). Make sure you're looking at the right one - `no-mistakes daemon status` reports which.
 
-## `no-mistakes update` prompts or aborts
+## `no-mistakes update` refuses or aborts
 
-Symptom: `update` warns about active pipeline runs, says the daemon is running from a different executable path, or aborts because the daemon executable path cannot be determined.
+Symptom: `update` refuses because active pipeline runs are in progress, prompts because the daemon is running from a different executable path, or aborts because the daemon executable path cannot be determined.
 
-When pending or running pipeline runs exist, `update` warns that restarting the daemon can cause those runs to fail and prompts before continuing.
-When the running daemon uses a different binary, `update` prompts before replacing it.
-Pass `no-mistakes update -y` to confirm non-interactively while still printing warnings.
+`update`, `daemon stop`, and `daemon restart` all refuse by default while pipeline runs are active and list the affected runs; [Daemon & Worktrees](/no-mistakes/concepts/daemon/#starting-and-stopping) owns the guard's exact rules, including why `-y`/`--yes` does not bypass it.
 
-If the daemon executable path can't be determined at all (stale PID, permissions), the update aborts before replacing anything.
+First inspect each listed run with `no-mistakes axi status --run <id>`.
+A parked CI gate can clear itself after its PR becomes terminal, including after a daemon restart.
+The [`ci_timeout` reference](/no-mistakes/reference/global-config/#ci_timeout) owns the exact fail-closed reconciliation rules, and [Daemon & Worktrees](/no-mistakes/concepts/daemon/#crash-recovery) owns restart behavior.
 
-Fix:
+After upgrading from an older release, starting the daemon automatically completes stale active rows that already have a persisted merged or closed PR state.
+Do not edit `state.sqlite` directly.
+
+Only when you have confirmed it is acceptable for every remaining listed active run to fail, force the lifecycle operation:
 
 ```sh
-no-mistakes daemon stop
+no-mistakes daemon stop --force
 no-mistakes update
 ```
 
 ## Agent binary not detected
 
-Symptom: `doctor` shows `–` for your native agent, or the pipeline errors with "agent binary not found."
+Symptom: `doctor` reports that gate validation is unavailable, or a run fails before its first pipeline step because no runnable agent was found.
+
+This is a hard failure, not a degraded validation mode.
+`no-mistakes` will not silently skip review, test evidence, documentation, or agent-assisted lint and report the remaining work as a passed gate.
 
 ### Check PATH
 
@@ -103,11 +122,17 @@ agent_path_override:
   claude: /Users/you/.local/bin/claude
 ```
 
-For `agent: acp:<target>`, set `acpx_path` instead:
+For `agent: acp:<target>` and ACP aliases such as `agent: cursor`, set `acpx_path` for the bridge.
+If the raw target command is also outside `PATH`, set its target key in `acp_registry_overrides`; `agent_path_override` applies only to native agents:
 
 ```yaml
 acpx_path: /Users/you/.local/bin/acpx
+acp_registry_overrides:
+  cursor: /Users/you/.local/bin/cursor-agent acp
 ```
+
+For Antigravity or Gemini-based driving agents, install a supported native agent CLI separately or configure a working ACP target such as `agent: acp:gemini` with `acpx` installed.
+The calling agent is the AXI driver, not an implicit pipeline-agent backend.
 
 The daemon logs its effective `PATH` at startup in `~/.no-mistakes/logs/daemon.log` with the message `daemon environment ready`. If the log contains `login shell environment resolution failed` or `login shell environment resolution returned no entries`, the daemon used a degraded fallback `PATH` that may omit version-manager directories such as nvm, fnm, or volta, so tools like `pnpm` may be missing.
 
@@ -130,7 +155,7 @@ Pipeline prompts steer agents to keep intentional writes inside the disposable w
 This reduces macOS App Management prompts from agent-invoked commands, but it is not an OS sandbox.
 
 If you still see prompts, check the step log for commands that intentionally write outside the worktree and move that setup into your normal development environment or an explicit repo-local command.
-Requested test evidence may still be written under the managed temporary `no-mistakes-evidence` directory, or under the configured in-repo evidence directory when `test.evidence.store_in_repo` is enabled.
+Requested test evidence may still be written under the managed evidence directory (`<NM_HOME>/evidence/<run-id>` by default). On GitHub, it is published to the push-target repository's orphan evidence branch when `test.evidence.store_in_repo` is enabled; the [Global Config Reference](/no-mistakes/reference/global-config/#testevidence) lists the cases that leave it local instead.
 Normal tool temp or cache writes can still happen outside the worktree.
 Testing prompts ask agents to remove transient working-tree artifacts they created, such as downloaded models, caches, build outputs, large binaries, or generated data directories, before completion.
 
@@ -171,28 +196,30 @@ If it's missing, run `no-mistakes init` again.
 Re-running init refreshes an existing gate and repairs the `no-mistakes` remote when it is missing.
 It also reattaches an existing gate after you rename or move the repo directory, as long as the old path no longer exists.
 
-### Check the hook
+### Check the receive hooks
 
-The gate's bare repo has a `post-receive` hook that notifies the daemon. Look at the gate path:
+The gate's bare repo has a `pre-receive` hook that authorizes ref updates before mutation and a `post-receive` hook that notifies the daemon after an admitted push. Look at the gate path:
 
 ```sh
 no-mistakes status
 # gate path is shown in the output
 
-ls -la <gate-path>/hooks/post-receive
+ls -la <gate-path>/hooks/pre-receive <gate-path>/hooks/post-receive
 ```
 
-The hook should be executable. If it's missing or non-executable, `no-mistakes init` will reinstall it for an existing no-mistakes-managed gate.
-For existing gate repos, `no-mistakes daemon restart` also installs missing no-mistakes-managed hooks and refreshes legacy managed hooks without overwriting custom hooks.
+Both hooks should be executable. If either is missing or non-executable, `no-mistakes init` will reinstall it for an existing no-mistakes-managed gate.
+For validated registered gates and strictly named legacy gates, `no-mistakes daemon restart` also installs missing no-mistakes-managed hooks and refreshes legacy managed hooks. An existing custom pre-receive hook is preserved behind the managed admission wrapper.
+Current managed hooks resolve the gate as an absolute bare-repo path before notifying the daemon, so a shell with a bad `PWD` value cannot accidentally report the gate as `.`.
+If `notify-push.log` mentions `invalid gate path: .`, refresh the managed hook with `no-mistakes init` or `no-mistakes daemon restart`, then push again.
 
 Also check `<gate-path>/notify-push.log`. The hook now appends daemon notification failures there and prints the same error back to the pushing client.
 
 ### Check the daemon socket
 
-The hook talks to the daemon over `~/.no-mistakes/socket`. If the daemon isn't running, the push still succeeds (the hook never blocks), but no pipeline starts. Start the daemon and push again.
+Both receive hooks talk to the daemon over `~/.no-mistakes/socket`. If the daemon is not running, pre-receive admission fails closed and the push is rejected before any gate ref changes. Start the daemon and push again.
 
-If the gate is older, re-running `no-mistakes init` or restarting the daemon also reapplies hook-path isolation for existing bare repos when Git supports `config --worktree`.
-That protects the gate hook if a tool such as Husky wrote `core.hookspath` into shared git config from inside a linked worktree.
+If the gate is older, re-running `no-mistakes init` or restarting the daemon also reapplies hook-path isolation when Git supports `config --worktree`.
+That protects the gate hook if a tool such as Husky wrote `core.hookspath` into shared git config from inside a linked worktree. [Crash recovery](/no-mistakes/concepts/daemon/#crash-recovery) owns the gate validation and migration rules used during restart.
 
 ## PR step is skipped
 
@@ -200,49 +227,60 @@ Symptom: pipeline completes but the PR step shows `skipped`.
 
 Check the [Provider Integration](/no-mistakes/guides/provider-integration/) requirements. Most common causes:
 
-- `gh` or `glab` not installed
-- `gh auth status` shows not authenticated
+- `gh`, `glab`, `forgejo-axi`, or `tea` not installed
+- The provider CLI reports that it is not authenticated
 - Bitbucket env vars not set in the daemon's environment
-- Upstream is on a host that isn't supported (GitHub, GitLab, `bitbucket.org`, or Azure DevOps)
+- Upstream is not one of the hosts listed in Provider Integration
 - Self-hosted GitHub Enterprise on a hostname that is not `github.com` isn't detected because `gh` isn't configured for the host; run `gh auth login --hostname your-ghe.example.com` so detection finds it. Once detection succeeds, the availability check is host-scoped (`gh auth status --hostname your-ghe.example.com`), so a stale token on `github.com` or any other configured gh host can no longer falsely mark the GHE repo as unauthenticated.
 - Self-hosted GitLab on a hostname with no `gitlab` marker isn't detected because `glab` isn't configured for the host; run `glab auth login --hostname your-gitlab.example.com` so detection finds it. Once detection succeeds, the availability check is host-scoped (`glab auth status --hostname your-gitlab.example.com`), so a stale token on `gitlab.com` or any other configured glab host can no longer falsely mark the self-hosted repo as unauthenticated.
-- A GitLab, Bitbucket, or Azure DevOps repo record has a fork URL set; fork MR/PR routing is currently GitHub-only
-- You pushed the default branch (PR step always skips on the default branch)
+- Self-hosted Gitea isn't detected because `tea` has no login configured for the host; run `tea logins add --url https://your-gitea.example.com --token <token> --name <name>` so detection finds it. See [Self-hosted Gitea](/no-mistakes/guides/provider-integration/#self-hosted-gitea).
+- A non-GitHub repo record has a fork URL set; fork MR/PR routing is currently GitHub-only
+- You pushed the PR base branch (PR step always skips there; this is the repository's default branch, or the configured [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) when set)
 
 ## CI step stuck or timed out
 
 Symptom: CI step keeps monitoring an open PR longer than expected, or pauses after the idle timeout.
 
-`ci_timeout` defaults to `168h` (7 days) and is an idle timeout.
-It re-arms whenever the upstream default branch advances, so an active long-lived PR keeps being watched.
-If the provider later reports an actual GitHub, GitLab, or Azure DevOps merge conflict, the CI auto-fix path rebases and re-pushes the branch; a clean behind PR needs no command.
-Set it in `~/.no-mistakes/config.yaml` to choose a different idle window:
+Monitoring while the PR remains open - even after checks are currently healthy - is intended behavior, because a later default-branch update can make the PR conflict or rerun CI.
+Once the CI monitor reports readiness and the PR is mergeable, the CI panel shows `✓ Checks passed` and the terminal title switches to `Checks passed`, so you can tell when to go merge the PR; the signal clears automatically if checks start re-running or a new failure appears. A trusted [`no_ci: true` declaration](/no-mistakes/reference/repo-config/#no_ci) can establish readiness for a zero-check repository; an empty forge response without that declaration is not ready. The [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) owns the exact readiness and signal-clearing rules, including GitHub Actions runs that do not appear in the PR check rollup.
 
-```yaml
-ci_timeout: "24h"
-```
+How long the monitor runs is controlled by `ci_timeout` in `~/.no-mistakes/config.yaml`, an idle timeout that re-arms whenever the upstream default branch advances; the [`ci_timeout` field reference](/no-mistakes/reference/global-config/#ci_timeout) owns the default, the `unlimited` keyword and its aliases, and the exact re-arm semantics.
+Older config files may still contain an explicit `ci_timeout: "4h"` value; update it if you want the newer default behavior.
 
-Set it to `unlimited` to monitor until the PR is merged, closed, or aborted:
-
-```yaml
-ci_timeout: "unlimited"
-```
-
-`none`, `off`, `never`, `0`, and other non-positive durations are accepted too.
-
-Older config files may still contain an explicit `ci_timeout: "4h"` value.
-Update that value if you want the newer default behavior.
-
-The CI step keeps monitoring while the PR remains open, even after checks are currently healthy, because a later default-branch update can make the PR conflict or rerun CI.
-Once checks are green and the PR is mergeable, the CI panel shows `✓ Checks passed` and the terminal title switches to `Checks passed`, so you can tell when to go merge the PR.
-The signal clears automatically if checks start re-running or a new failure appears.
 If the PR is still open at the timeout, the step pauses for approval with findings for the open monitoring state or any known unresolved failures.
 You can approve, fix, or skip from the TUI or `no-mistakes axi respond`.
+
+A park that happens **before** the timeout, with a finding that CI checks could not be read from the provider, means the check read itself is failing (after 6 consecutive failed polls, the step stops waiting instead of spinning to `ci_timeout`). The finding is provider-neutral and the step log shows the underlying provider error; for GitHub, a `gh` older than 2.50 rejects the `gh pr checks --json` call and needs upgrading. The same park on GitLab, Bitbucket Cloud, or Azure DevOps points at that provider's CLI or credentials instead.
 Use `no-mistakes axi abort` only when you mean to cancel the whole active run.
+
+## Step looks quiet or wedged
+
+Symptom: `no-mistakes axi status` shows an active step with `last_activity` prefixed by `quiet`, or a review/test/lint step appears to run for longer than expected.
+
+`quiet` means the step has not recorded a step-log line or native-agent lifecycle event for longer than [`step_quiet_warning`](/no-mistakes/reference/global-config/#step_quiet_warning).
+It is only a liveness signal.
+It does not cancel the step, fail the run, or mean the pipeline is safe to bypass.
+
+A quiet Review step still ends on its own: its agent turns are bounded by [`review_agent_timeout`](/no-mistakes/reference/global-config/#review_agent_timeout), after which the run fails with a timeout diagnostic in the step log.
+A quiet Test step is bounded the same way by [`test_agent_timeout`](/no-mistakes/reference/global-config/#test_agent_timeout), covering the post-test evidence-gathering agent and a Test-repair turn.
+Every other agent-spawning step (Document, Lint, Rebase conflict repair, PR drafting, CI auto-fix) is bounded by [`agent_timeout`](/no-mistakes/reference/global-config/#agent_timeout), so a stall reaches the step's normal agent-error handling instead of remaining active until you abort. Those errors fail agent-driven mutation steps; PR drafting instead continues with its deterministic fallback content.
+
+Start by reading the active run and the step log:
+
+```sh
+no-mistakes axi status
+no-mistakes axi logs --step <step> --full
+```
+
+The `active_steps` table shows how long the step has been active, the latest activity, the native subprocess PID when one is running, and the current round such as `round 1`, `auto-fix 1/3`, or `fix 2`.
+The step log records native subprocess start, exit, and retry lines plus markers for automatic and user-triggered fix rounds.
+If the step is parked at a gate, use `no-mistakes axi respond` instead of waiting.
+If the run is genuinely stuck and you want to discard it, use `no-mistakes axi abort`.
+Start a new run only after abort confirms the terminal state; see the [abort command contract](/no-mistakes/reference/cli/#no-mistakes-axi-abort).
 
 ## Worktree won't clean up
 
-Symptom: `~/.no-mistakes/worktrees/<repoID>/<runID>/` sticks around after a run ends.
+Symptom: `~/.no-mistakes/worktrees/<repoID>/<runID>/` - or `<root>/<runID>` when the repository has a [configured worktree root](/no-mistakes/reference/global-config/#worktree_roots) - sticks around after a run ends.
 
 The daemon removes worktrees at run completion, and also on daemon startup (crash recovery). If one is still there:
 
@@ -264,12 +302,15 @@ no-mistakes daemon start
 When state is genuinely wedged:
 
 ```sh
-no-mistakes daemon stop
+no-mistakes daemon stop --force
 rm -rf ~/.no-mistakes/worktrees ~/.no-mistakes/servers ~/.no-mistakes/socket ~/.no-mistakes/daemon.pid ~/.no-mistakes/daemon.lock
 no-mistakes daemon start
 ```
 
+If [`worktree_roots`](/no-mistakes/reference/global-config/#worktree_roots) places a repository's runs outside `NM_HOME`, delete the leftover `<root>/<run id>` directories there as well - only those; the root is your own directory and holds nothing else of no-mistakes'.
+
 This keeps your gate repos, database, and config but clears transient state. For a full wipe, see the [Uninstall section](/no-mistakes/start-here/installation/#uninstall).
+Wedged state often means a run is stuck `pending` or `running`, so `daemon stop` refuses without `--force`; only force through once you've confirmed it's fine for the listed runs to fail.
 
 ## Still stuck
 

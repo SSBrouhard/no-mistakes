@@ -112,6 +112,53 @@ func TestStartStep(t *testing.T) {
 	if got.StartedAt == nil {
 		t.Error("expected non-nil started_at")
 	}
+	if got.LastActivityAt == nil {
+		t.Error("expected non-nil last_activity_at")
+	}
+	if got.LastActivity == nil || *got.LastActivity != "step started" {
+		t.Errorf("last_activity = %v, want step started", got.LastActivity)
+	}
+}
+
+func TestStepActivity(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+	run, _ := d.InsertRun(repo.ID, "feature", "abc", "def")
+	step, _ := d.InsertStepResult(run.ID, types.StepReview)
+
+	if err := d.StartStep(step.ID); err != nil {
+		t.Fatalf("start step: %v", err)
+	}
+	pid := 12345
+	if err := d.SetStepAgentActivity(step.ID, "codex started pid=12345", &pid); err != nil {
+		t.Fatalf("set agent activity: %v", err)
+	}
+	got, _ := d.GetStepResult(step.ID)
+	if got.AgentPID == nil || *got.AgentPID != pid {
+		t.Fatalf("agent_pid = %v, want %d", got.AgentPID, pid)
+	}
+	if got.LastActivity == nil || *got.LastActivity != "codex started pid=12345" {
+		t.Fatalf("last_activity = %v, want codex start", got.LastActivity)
+	}
+
+	if err := d.TouchStepActivity(step.ID, "log: still working"); err != nil {
+		t.Fatalf("touch activity: %v", err)
+	}
+	got, _ = d.GetStepResult(step.ID)
+	if got.AgentPID == nil || *got.AgentPID != pid {
+		t.Fatalf("touch should preserve agent_pid, got %v", got.AgentPID)
+	}
+	if got.LastActivity == nil || *got.LastActivity != "log: still working" {
+		t.Fatalf("last_activity = %v, want log activity", got.LastActivity)
+	}
+
+	if err := d.SetStepAgentActivity(step.ID, "codex exited pid=12345 status=success", nil); err != nil {
+		t.Fatalf("clear agent activity: %v", err)
+	}
+	got, _ = d.GetStepResult(step.ID)
+	if got.AgentPID != nil {
+		t.Fatalf("agent_pid = %v, want nil after exit", *got.AgentPID)
+	}
 }
 
 func TestCompleteStep(t *testing.T) {
@@ -168,6 +215,51 @@ func TestCompleteStepWithStatus(t *testing.T) {
 	}
 }
 
+func TestResetStepsFromPreservesSkippedSteps(t *testing.T) {
+	d := openTestDB(t)
+	repo, err := d.InsertRepo("/tmp/gate", "https://example.com/repo.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.InsertRun(repo.ID, "main", "abc123", "def456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	review, err := d.InsertStepResult(run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	push, err := d.InsertStepResult(run.ID, types.StepPush)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CompleteStepWithStatus(review.ID, types.StepStatusCompleted, 0, 10, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CompleteStepWithStatus(push.ID, types.StepStatusSkipped, 0, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.ResetStepsFrom(run.ID, types.StepReview.Order()); err != nil {
+		t.Fatal(err)
+	}
+
+	gotReview, err := d.GetStepResult(review.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotReview.Status != types.StepStatusPending {
+		t.Fatalf("review status = %s, want %s", gotReview.Status, types.StepStatusPending)
+	}
+	gotPush, err := d.GetStepResult(push.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPush.Status != types.StepStatusSkipped {
+		t.Fatalf("push status = %s, want %s", gotPush.Status, types.StepStatusSkipped)
+	}
+}
+
 func TestUpdateStepStatusWithDuration(t *testing.T) {
 	d := openTestDB(t)
 	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
@@ -184,6 +276,72 @@ func TestUpdateStepStatusWithDuration(t *testing.T) {
 	}
 	if got.DurationMS == nil || *got.DurationMS != 1200 {
 		t.Fatalf("duration_ms = %v, want 1200", got.DurationMS)
+	}
+}
+
+func TestParkStepForApproval_FindingsFailureRollsBackGate(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/tmp/findings-atomic", "https://example.com/repo.git", "main")
+	run, _ := d.InsertRun(repo.ID, "feature", "head", "base")
+	step, _ := d.InsertStepResult(run.ID, types.StepReview)
+	if _, err := d.sql.Exec(`
+		CREATE TRIGGER fail_findings_update
+		BEFORE UPDATE OF findings_json ON step_results
+		BEGIN
+			SELECT RAISE(FAIL, 'findings write failed');
+		END
+	`); err != nil {
+		t.Fatal(err)
+	}
+	findings := `{"items":[{"id":"review-1"}]}`
+
+	if err := d.ParkStepForApproval(run.ID, step.ID, types.StepStatusAwaitingApproval, 100, &findings); err == nil {
+		t.Fatal("expected findings persistence failure")
+	}
+	gotStep, err := d.GetStepResult(step.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRun, err := d.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotStep.Status != types.StepStatusPending || gotStep.FindingsJSON != nil {
+		t.Fatalf("step was partially parked: %#v", gotStep)
+	}
+	if gotRun.AwaitingAgentSince != nil {
+		t.Fatal("run was marked awaiting agent after findings persistence failed")
+	}
+}
+
+func TestCompleteReviewStepIsAtomic(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/tmp/review-atomic", "https://example.com/repo.git", "main")
+	run, _ := d.InsertRun(repo.ID, "feature", "head", "base")
+	step, _ := d.InsertStepResult(run.ID, types.StepReview)
+	if err := d.StartStep(step.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.CompleteReviewStep(step.ID, "missing-run", "approved", 0, 10, "review.log"); err == nil {
+		t.Fatal("expected missing run to roll back review completion")
+	}
+	gotStep, _ := d.GetStepResult(step.ID)
+	if gotStep.Status != types.StepStatusRunning || gotStep.CompletedAt != nil {
+		t.Fatalf("failed transaction partially completed review: %#v", gotStep)
+	}
+	gotRun, _ := d.GetRun(run.ID)
+	if gotRun.ReviewApprovedHeadSHA != nil {
+		t.Fatalf("failed transaction created review authority: %#v", gotRun.ReviewApprovedHeadSHA)
+	}
+
+	if err := d.CompleteReviewStep(step.ID, run.ID, "approved", 0, 10, "review.log"); err != nil {
+		t.Fatal(err)
+	}
+	gotStep, _ = d.GetStepResult(step.ID)
+	gotRun, _ = d.GetRun(run.ID)
+	if gotStep.Status != types.StepStatusCompleted || gotRun.ReviewApprovedHeadSHA == nil || *gotRun.ReviewApprovedHeadSHA != "approved" {
+		t.Fatalf("atomic review completion = step %#v run %#v", gotStep, gotRun)
 	}
 }
 

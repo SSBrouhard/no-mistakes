@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"errors"
-	"fmt"
 	"math/rand"
 	"regexp"
 	"strings"
@@ -53,7 +52,8 @@ func transientBackoffBaseDuration(attempt int, base time.Duration) time.Duration
 // runWithRetry invokes runOnce up to maxRetries+1 times, retrying when the
 // classifier marks the error as retriable. Between retries it sleeps with
 // exponential backoff (via transientBackoff) and respects ctx cancellation.
-// The retry attempt and classification label are surfaced to opts.OnChunk.
+// The retry attempt and classification label are surfaced to opts.OnLifecycle,
+// falling back to opts.OnChunk for older direct callers.
 func runWithRetry(
 	ctx context.Context,
 	name string,
@@ -67,17 +67,14 @@ func runWithRetry(
 	var lastLabel string
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			if opts.OnChunk != nil {
-				opts.OnChunk(fmt.Sprintf(
-					"%s retrying after transient error %q (attempt %d/%d)",
-					name, lastLabel, attempt+1, maxRetries+1,
-				))
-			}
+			emitAgentRetry(opts, name, lastLabel, attempt+1, maxRetries+1)
 			if err := transientBackoff(ctx, attempt); err != nil {
 				return nil, err
 			}
 		}
+		startedAt := time.Now()
 		result, err := runOnce()
+		emitAgentAttempt(opts, name, result, err, startedAt, time.Now())
 		if err == nil {
 			return result, nil
 		}
@@ -92,6 +89,29 @@ func runWithRetry(
 		lastLabel = label
 	}
 	return nil, lastErr
+}
+
+func emitAgentAttempt(opts RunOpts, name string, result *Result, err error, startedAt, completedAt time.Time) {
+	if opts.OnAttempt == nil {
+		return
+	}
+	opts.OnAttempt(Attempt{
+		Agent:           name,
+		Result:          result,
+		Err:             err,
+		StartedAt:       startedAt,
+		CompletedAt:     completedAt,
+		Session:         cloneSessionRef(opts.Session),
+		SessionFallback: opts.SessionFallback,
+	})
+}
+
+func cloneSessionRef(session *SessionRef) *SessionRef {
+	if session == nil {
+		return nil
+	}
+	copy := *session
+	return &copy
 }
 
 // claudeRetryClassifier retries both transient API errors and the
@@ -124,6 +144,31 @@ var transientNeedles = []struct {
 	{"temporary failure in name resolution", "dns temporary failure"},
 	{"tls handshake", "tls handshake failure"},
 	{"unexpected eof", "unexpected eof"},
+	// A model ending its turn with prose instead of the required JSON object
+	// is a stochastic behavior, not a deterministic defect: the step's real
+	// work is typically already complete, so a cold retry succeeds often
+	// enough to be worth more than a terminal failure.
+	{"ended its turn with prose", "prose final turn"},
+	// agy's strict tool-call validation kills the whole run when the model
+	// emits one malformed call; the step work is usually already complete.
+	{"declaring permissions", "agy permission declaration"},
+	{"invalid tool call", "invalid tool call"},
+}
+
+var terminalNeedles = []struct {
+	needle string
+	label  string
+}{
+	{"freeusagelimit", "free usage limit"},
+	{"free usage limit", "free usage limit"},
+	{"free_usage_limit", "free usage limit"},
+	{"insufficient quota", "insufficient quota"},
+	{"insufficient_quota", "insufficient quota"},
+	{"exceeded your current quota", "quota exceeded"},
+	{"quota exceeded", "quota exceeded"},
+	{"quota_exceeded", "quota exceeded"},
+	{"quota exhausted", "quota exhausted"},
+	{"quota_exhausted", "quota exhausted"},
 }
 
 // classifyTransient reports whether an error message looks like a transient
@@ -137,6 +182,9 @@ func classifyTransient(err error) (string, bool) {
 		return "", false
 	}
 	msg := strings.ToLower(err.Error())
+	if isTerminalRetryError(msg) {
+		return "", false
+	}
 	for _, sig := range transientNeedles {
 		if strings.Contains(msg, sig.needle) {
 			return sig.label, true
@@ -146,4 +194,13 @@ func classifyTransient(err error) (string, bool) {
 		return "http " + m, true
 	}
 	return "", false
+}
+
+func isTerminalRetryError(msg string) bool {
+	for _, sig := range terminalNeedles {
+		if strings.Contains(msg, sig.needle) {
+			return true
+		}
+	}
+	return false
 }

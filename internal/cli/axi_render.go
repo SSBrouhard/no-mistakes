@@ -2,6 +2,8 @@ package cli
 
 import (
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
 
 	toon "github.com/toon-format/toon-go"
@@ -19,7 +21,10 @@ var nowUnix = func() int64 { return time.Now().Unix() }
 // maxFindingDesc caps a finding description rendered inline. Findings are the
 // decision content at a gate, so the limit is generous; only pathological
 // descriptions get truncated, with the full length disclosed.
-const maxFindingDesc = 600
+const (
+	maxFindingDesc = 600
+	maxGateSummary = 1200
+)
 
 // Row types carry `toon` tags so the encoder renders a []row slice as a
 // tabular array (name[N]{cols}:) with one comma-delimited line per element.
@@ -28,6 +33,15 @@ type stepRow struct {
 	Status     string `toon:"status"`
 	Findings   int    `toon:"findings"`
 	DurationMS int64  `toon:"duration_ms"`
+}
+
+type activeStepRow struct {
+	Step         string `toon:"step"`
+	Status       string `toon:"status"`
+	ActiveFor    string `toon:"active_for"`
+	LastActivity string `toon:"last_activity"`
+	AgentPID     string `toon:"agent_pid"`
+	Round        string `toon:"round"`
 }
 
 type findingRow struct {
@@ -62,20 +76,32 @@ type fixRow struct {
 // stepView is a render-ready view of a single pipeline step, decoupled from
 // whether it came from the daemon (ipc) or the local database.
 type stepView struct {
-	Name         string
-	Status       string
-	DurationMS   int64
-	FindingsJSON string
-	FixSummaries []string
+	ID               string
+	Name             string
+	Status           string
+	DurationMS       int64
+	FindingsJSON     string
+	FixSummaries     []string
+	StartedAt        *int64
+	LastActivityAt   *int64
+	LastActivity     string
+	AgentPID         *int
+	RoundCount       int
+	FixRoundCount    int
+	AutoFixLimit     int
+	PendingFixSource string
+	QuietWarning     time.Duration
 }
 
 // runView is a render-ready view of a pipeline run.
 type runView struct {
-	ID      string
-	Branch  string
-	Status  string
-	HeadSHA string
-	PRURL   string
+	ID          string
+	Branch      string
+	Status      string
+	HeadSHA     string
+	PRURL       string
+	CIReady     bool
+	CIReadyNoCI bool
 	// AwaitingAgentSince is the unix-seconds time the run parked at a gate
 	// awaiting the driving agent, or nil when the run is not parked. It powers
 	// the top-level parked signal in the run object.
@@ -89,13 +115,30 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 		Branch:             r.Branch,
 		Status:             string(r.Status),
 		HeadSHA:            r.HeadSHA,
+		CIReady:            r.CIReady,
+		CIReadyNoCI:        r.CIReadyNoCI,
 		AwaitingAgentSince: r.AwaitingAgentSince,
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
 	}
 	for _, s := range r.Steps {
-		sv := stepView{Name: string(s.StepName), Status: string(s.Status), FixSummaries: s.FixSummaries}
+		sv := stepView{
+			ID:               s.ID,
+			Name:             string(s.StepName),
+			Status:           string(s.Status),
+			FixSummaries:     s.FixSummaries,
+			StartedAt:        s.StartedAt,
+			LastActivityAt:   s.LastActivityAt,
+			AgentPID:         s.AgentPID,
+			RoundCount:       s.RoundCount,
+			FixRoundCount:    s.FixRoundCount,
+			AutoFixLimit:     s.AutoFixLimit,
+			PendingFixSource: s.PendingFixSource,
+		}
+		if s.LastActivity != nil {
+			sv.LastActivity = *s.LastActivity
+		}
 		if s.DurationMS != nil {
 			sv.DurationMS = *s.DurationMS
 		}
@@ -119,7 +162,20 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult) runView {
 		rv.PRURL = *r.PRURL
 	}
 	for _, s := range steps {
-		sv := stepView{Name: string(s.StepName), Status: string(s.Status)}
+		sv := stepView{
+			ID:             s.ID,
+			Name:           string(s.StepName),
+			Status:         string(s.Status),
+			StartedAt:      s.StartedAt,
+			LastActivityAt: s.LastActivityAt,
+			AgentPID:       s.AgentPID,
+		}
+		if s.AutoFixLimit != nil {
+			sv.AutoFixLimit = *s.AutoFixLimit
+		}
+		if s.LastActivity != nil {
+			sv.LastActivity = *s.LastActivity
+		}
 		if s.DurationMS != nil {
 			sv.DurationMS = *s.DurationMS
 		}
@@ -240,6 +296,100 @@ func (rv runView) fixRows() []fixRow {
 	return rows
 }
 
+func (rv runView) activeRows() []activeStepRow {
+	var rows []activeStepRow
+	for _, s := range rv.Steps {
+		if s.Status != string(types.StepStatusRunning) && s.Status != string(types.StepStatusFixing) {
+			continue
+		}
+		rows = append(rows, activeStepRow{
+			Step:         s.Name,
+			Status:       s.Status,
+			ActiveFor:    s.activeFor(),
+			LastActivity: s.lastActivitySummary(),
+			AgentPID:     s.agentPIDString(),
+			Round:        s.roundSummary(),
+		})
+	}
+	return rows
+}
+
+func (s stepView) activeFor() string {
+	if s.StartedAt == nil {
+		return ""
+	}
+	return formatDurationSince(*s.StartedAt)
+}
+
+func (s stepView) lastActivitySummary() string {
+	if s.LastActivityAt == nil {
+		return "unknown"
+	}
+	prefix := formatDurationSince(*s.LastActivityAt) + " ago"
+	secs := nowUnix() - *s.LastActivityAt
+	if secs < 0 {
+		secs = 0
+	}
+	if s.QuietWarning > 0 && time.Duration(secs)*time.Second >= s.QuietWarning {
+		prefix = "quiet " + prefix
+	}
+	if s.LastActivity == "" {
+		return prefix
+	}
+	return prefix + ": " + s.LastActivity
+}
+
+func (s stepView) agentPIDString() string {
+	if s.AgentPID == nil || *s.AgentPID == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d", *s.AgentPID)
+}
+
+func (s stepView) roundSummary() string {
+	if s.Status == string(types.StepStatusFixing) {
+		attempt := s.FixRoundCount
+		if s.PendingFixSource != "" {
+			attempt++
+		}
+		if s.PendingFixSource == db.RoundSelectionSourceAutoFix {
+			if s.AutoFixLimit > 0 {
+				return fmt.Sprintf("auto-fix %d/%d", attempt, s.AutoFixLimit)
+			}
+			return fmt.Sprintf("auto-fix %d", attempt)
+		}
+		if attempt > 0 {
+			return fmt.Sprintf("fix %d", attempt)
+		}
+		return "fixing"
+	}
+	if s.RoundCount > 0 {
+		return fmt.Sprintf("round %d", s.RoundCount)
+	}
+	return "starting"
+}
+
+func formatDurationSince(sinceUnix int64) string {
+	secs := nowUnix() - sinceUnix
+	if secs < 0 {
+		secs = 0
+	}
+	return formatCompactDuration(time.Duration(secs) * time.Second)
+}
+
+func formatCompactDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+	default:
+		return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
+	}
+}
+
 func joinComma(parts []string) string {
 	out := ""
 	for i, p := range parts {
@@ -281,6 +431,9 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 		rows = append(rows, stepRow{Step: s.Name, Status: s.Status, Findings: s.findingCount(), DurationMS: s.DurationMS})
 	}
 	fields = append(fields, toon.Field{Key: "steps", Value: rows})
+	if activeRows := rv.activeRows(); len(activeRows) > 0 {
+		fields = append(fields, toon.Field{Key: "active_steps", Value: activeRows})
+	}
 	return toon.Field{Key: key, Value: toon.NewObject(fields...)}
 }
 
@@ -293,7 +446,7 @@ func gateFields(gate stepView) []toon.Field {
 		{Key: "status", Value: gate.Status},
 	}
 	if parsed.Summary != "" {
-		gfields = append(gfields, toon.Field{Key: "summary", Value: parsed.Summary})
+		gfields = append(gfields, toon.Field{Key: "summary", Value: truncate(parsed.Summary, maxGateSummary)})
 	}
 	if parsed.RiskLevel != "" {
 		gfields = append(gfields, toon.Field{Key: "risk", Value: parsed.RiskLevel})
@@ -324,6 +477,7 @@ func gateFields(gate stepView) []toon.Field {
 			"Run `no-mistakes axi respond --action skip` to skip this step",
 			fmt.Sprintf("Run `no-mistakes axi logs --step %s --full` to read the full step log", gate.Name),
 			"A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.",
+			preserveGateFixCommitsGuidance,
 		}},
 	}
 }
@@ -341,12 +495,127 @@ func truncate(s string, limit int) string {
 // --- output helpers ---
 
 // axiDoc marshals an ordered set of TOON fields into a document with a trailing
-// newline. Encoding errors are impossible for the value shapes we build here,
-// so a failure degrades to an empty document rather than propagating.
+// newline. AXI fields can include arbitrary subprocess output, findings, and
+// provider data. TOON intentionally rejects most C0 controls, so make those
+// bytes visible before encoding instead of dropping the entire document.
 func axiDoc(fields ...toon.Field) string {
-	out, err := toon.MarshalString(toon.NewObject(fields...))
+	value := sanitizeTOONValue(toon.NewObject(fields...))
+	out, err := toon.MarshalString(value)
 	if err != nil {
-		return ""
+		return axiEncodingError(err)
+	}
+	return out + "\n"
+}
+
+// escapeUnsupportedTOONControls converts only C0 bytes the TOON encoder cannot
+// represent. Byte-wise copying preserves all printable Unicode and arbitrary
+// non-ASCII evidence exactly; tab, carriage return, and newline keep TOON's
+// supported escaping semantics.
+func escapeUnsupportedTOONControls(s string) string {
+	first := -1
+	for i := 0; i < len(s); i++ {
+		if unsupportedTOONControl(s[i]) {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s) + 3)
+	b.WriteString(s[:first])
+	for i := first; i < len(s); i++ {
+		if unsupportedTOONControl(s[i]) {
+			fmt.Fprintf(&b, `\x%02X`, s[i])
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func unsupportedTOONControl(b byte) bool {
+	return b < 0x20 && b != '\t' && b != '\r' && b != '\n'
+}
+
+// sanitizeTOONValue recursively copies the render value while escaping strings.
+// Keeping each concrete type intact preserves TOON's existing ordered objects,
+// struct field names, and tabular-array rendering.
+func sanitizeTOONValue(value any) any {
+	return sanitizeTOONReflect(reflect.ValueOf(value)).Interface()
+}
+
+func sanitizeTOONReflect(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+
+	switch value.Kind() {
+	case reflect.String:
+		out := reflect.New(value.Type()).Elem()
+		out.SetString(escapeUnsupportedTOONControls(value.String()))
+		return out
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.New(value.Type()).Elem()
+		out.Set(sanitizeTOONReflect(value.Elem()))
+		return out
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.New(value.Type().Elem())
+		out.Elem().Set(sanitizeTOONReflect(value.Elem()))
+		return out
+	case reflect.Struct:
+		out := reflect.New(value.Type()).Elem()
+		out.Set(value)
+		for i := 0; i < value.NumField(); i++ {
+			if value.Type().Field(i).PkgPath != "" {
+				continue
+			}
+			out.Field(i).Set(sanitizeTOONReflect(value.Field(i)))
+		}
+		return out
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for i := 0; i < value.Len(); i++ {
+			out.Index(i).Set(sanitizeTOONReflect(value.Index(i)))
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			out.Index(i).Set(sanitizeTOONReflect(value.Index(i)))
+		}
+		return out
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iter := value.MapRange()
+		for iter.Next() {
+			out.SetMapIndex(iter.Key(), sanitizeTOONReflect(iter.Value()))
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func axiEncodingError(err error) string {
+	message := "encode AXI output: " + escapeUnsupportedTOONControls(err.Error())
+	out, fallbackErr := toon.MarshalString(toon.NewObject(toon.Field{Key: "error", Value: message}))
+	if fallbackErr != nil {
+		return "error: \"encode AXI output failed\"\n"
 	}
 	return out + "\n"
 }

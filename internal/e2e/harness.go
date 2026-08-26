@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/daemon"
+	"github.com/kunchenguid/no-mistakes/internal/e2edaemon"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -40,16 +42,17 @@ type Harness struct {
 	AgentLog    string // every fake-agent invocation appended here, one JSON per line
 	Scenario    string // optional path to a scenario yaml; empty = built-in default
 
-	agentName         string // claude / codex / opencode
+	agentName         string // claude / codex / grok / opencode / antigravity
 	allowRepoCommands *bool  // mirrors SetupOpts.AllowRepoCommands
+	daemonOwn         *e2edaemon.Ownership
 }
 
 // SetupOpts controls per-test setup.
 type SetupOpts struct {
-	// Agent picks which fake the harness wires up: "claude", "codex", or
-	// "opencode". The other two binaries are still on PATH (so `auto`
-	// detection finds the requested one first via config), but only the
-	// chosen one is exercised.
+	// Agent picks which fake the harness wires up: "claude", "codex", "grok",
+	// "opencode", or "antigravity". The other binaries are still on PATH (so
+	// `auto` detection finds the requested one first via config), but only
+	// the chosen one is exercised.
 	Agent string
 
 	// Scenario is an optional path to a YAML scenario file. If empty the
@@ -106,15 +109,19 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
+	h.writeLoginShellPathSeed()
 
-	// Symlink each agent name to the same fake binary. Codex and Claude
-	// dispatch by argv[0] basename; opencode the same. Symlinks (not
-	// copies) keep the build cheap on subsequent tests. The `gh` symlink
-	// is a guard rail: BinDir is prepended to PATH, so any stray invocation
-	// of gh by the pipeline (e.g. PR/CI on a misconfigured origin) hits
-	// the fakeagent stub instead of a real, authenticated system gh.
-	for _, name := range []string{"claude", "codex", "opencode", "gh"} {
-		linkPath := filepath.Join(h.BinDir, name)
+	// Symlink each agent name to the same fake binary. Native agents dispatch
+	// by argv[0] basename; opencode does the same. Symlinks (not
+	// copies) keep the build cheap on subsequent tests. The `gh` and `tea`
+	// symlinks are a guard rail: BinDir is prepended to PATH, so any stray
+	// invocation of gh/tea by the pipeline (e.g. PR/CI on a misconfigured
+	// origin) hits the fakeagent stub instead of a real, authenticated
+	// system CLI. antigravity gets a second link under its probed binary
+	// name "agy" (internal/cli/doctor.go searches that name, not the agent
+	// name).
+	for _, name := range []string{"claude", "codex", "grok", "opencode", "antigravity", "agy", "gh", "tea"} {
+		linkPath := filepath.Join(h.BinDir, executableName(name))
 		if err := os.Symlink(fakeBin, linkPath); err != nil {
 			t.Fatalf("symlink %s: %v", linkPath, err)
 		}
@@ -132,8 +139,9 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 	}
 	// Point the fake at recorded real-agent fixtures by default. When
 	// the directory contains <agent>/structured.{jsonl,*}, the fake
-	// replays those bytes verbatim instead of generating synthetic
-	// output. This is what makes the e2e a real wire-format check.
+	// replays those recorded wire envelopes instead of generating synthetic
+	// output, patching scenario-dependent fields where the adapter needs to.
+	// This is what makes the e2e a real wire-format check.
 	fixtureRoot, err := defaultFixtureRoot()
 	if err != nil {
 		t.Fatalf("fixture root: %v", err)
@@ -156,8 +164,30 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 	h.writeGlobalConfig()
 	h.initGitRepos()
 
+	// Temporary-daemon ownership: inventory + concurrency slot. The suite
+	// wrapper (scripts/e2e.sh) and TestMain reaper recover if Cleanup never
+	// runs (timeout / SIGKILL of the test process).
+	own, err := e2edaemon.Acquire(h.NMHome, h.NMBin, 2*time.Minute)
+	if err != nil {
+		t.Fatalf("acquire e2e daemon ownership: %v", err)
+	}
+	h.daemonOwn = own
+
 	t.Cleanup(h.shutdown)
 	return h
+}
+
+func (h *Harness) writeLoginShellPathSeed() {
+	line := "export PATH=" + shellQuote(h.BinDir) + ":$PATH\n"
+	for _, name := range []string{".zshenv", ".zprofile", ".bash_profile", ".profile"} {
+		if err := os.WriteFile(filepath.Join(h.HomeDir, name), []byte(line), 0o644); err != nil {
+			h.t.Fatalf("write %s: %v", name, err)
+		}
+	}
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 // writeGlobalConfig writes a no-mistakes global config that pins the
@@ -262,7 +292,21 @@ func (h *Harness) RunInDirWithEnv(dir string, env map[string]string, args ...str
 	cmd.Dir = dir
 	cmd.Env = mergedEnv(os.Environ(), env)
 	out, err := cmd.CombinedOutput()
+	h.syncDaemonOwnership()
 	return string(out), err
+}
+
+// syncDaemonOwnership records a live daemon PID into the suite inventory when
+// a harness command has (possibly) started or restarted the detached daemon.
+func (h *Harness) syncDaemonOwnership() {
+	if h == nil || h.daemonOwn == nil || h.NMHome == "" {
+		return
+	}
+	pid, err := daemon.ReadPID(paths.WithRoot(h.NMHome))
+	if err != nil || pid <= 0 {
+		return
+	}
+	_ = h.daemonOwn.SyncPID(pid)
 }
 
 func mergedEnv(base []string, overrides map[string]string) []string {
@@ -412,12 +456,7 @@ func (h *Harness) WorktreeRefSHA(ref string) string {
 func (h *Harness) WaitForRun(branch string, timeout time.Duration) *ipc.RunInfo {
 	h.t.Helper()
 	return h.waitForRunStatus(branch, timeout, func(status types.RunStatus) bool {
-		switch status {
-		case types.RunCompleted, types.RunFailed, types.RunCancelled:
-			return true
-		default:
-			return false
-		}
+		return status.Terminal()
 	}, "finish")
 }
 
@@ -661,16 +700,37 @@ func (h *Harness) repoID() string {
 // cleanup. Ignoring errors here is intentional: the daemon may already
 // be gone, the binary may have failed to build, etc. We just want the
 // next test (or the developer's real daemon) not to inherit our state.
+// Ownership release also unregisters the inventory entry and frees the
+// concurrency slot; suite-wrapper / TestMain reapers cover the path where
+// this Cleanup never runs.
 func (h *Harness) shutdown() {
+	if h.daemonOwn != nil {
+		h.daemonOwn.NMBin = h.NMBin
+		h.daemonOwn.Release()
+		h.daemonOwn = nil
+		return
+	}
 	if _, err := os.Stat(h.NMBin); err != nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, h.NMBin, "daemon", "stop")
-	cmd.Dir = h.WorkDir
+	cmd.Dir = h.daemonStopDir()
 	cmd.Env = os.Environ()
 	_ = cmd.Run()
+}
+
+func (h *Harness) daemonStopDir() string {
+	for _, dir := range []string{h.WorkDir, h.HomeDir, os.TempDir()} {
+		if dir == "" {
+			continue
+		}
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+	}
+	return "."
 }
 
 // ---- Binary build cache ----

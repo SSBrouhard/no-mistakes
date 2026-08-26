@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/kunchenguid/no-mistakes/internal/gatecontext"
+	"github.com/kunchenguid/no-mistakes/internal/gateguidance"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/skill"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -23,6 +26,32 @@ var canonicalStaleMonitorPhrases = []string{
 	"re-pushes",
 	"no-mistakes rerun",
 }
+
+var canonicalPreserveGateFixPhrases = []string{
+	"post-pipeline",
+	"on top",
+	"every pipeline fix commit",
+}
+
+var canonicalBranchSyncPhrases = []string{
+	"branch_sync",
+	"no-mistakes axi sync",
+	"blocked",
+	"reset, stash, merge, rebase, force, or branch replacement",
+	// Guarded custody recovery for a terminal run whose pipeline commits were
+	// never published (v1.38.1 dogfood catch): the action, its next_action
+	// code, and the preservation claim must stay on every guidance surface.
+	"recover_custody",
+	"no-mistakes axi sync --recover",
+	"preserved in the local gate",
+	// Cancellation releases a run that never changed the submitted head
+	// (v1.44.2 dogfood catch): every surface must name the released state and
+	// that it needs no recovery.
+	"user_owned",
+	"before changing the submitted head",
+}
+
+const canonicalPipelineAgentPrerequisite = "a supported native agent binary, the `agent: cursor` ACP alias, or an explicit `acp:<target>` through `acpx`"
 
 // TestStaleMonitorGuidance_SyncedAcrossSurfaces guards the repo invariant that
 // agent-driving guidance stays in sync across its three surfaces: the skill
@@ -79,6 +108,131 @@ func TestStaleMonitorGuidance_InChecksPassedOutput(t *testing.T) {
 			t.Errorf("checks-passed output missing stale-monitor guidance phrase %q in:\n%s", phrase, got)
 		}
 	}
+}
+
+func TestPreserveGateFixGuidance_SyncedAcrossSurfaces(t *testing.T) {
+	surfaces := map[string]string{
+		"skill body":       skill.Markdown(),
+		"agents guide":     readAgentsGuide(t),
+		"axi run help":     newAxiRunCmd().Long,
+		"axi respond help": newAxiRespondCmd().Long,
+		"axi abort help":   newAxiAbortCmd().Long,
+	}
+	for name, content := range surfaces {
+		for _, phrase := range canonicalPreserveGateFixPhrases {
+			if !strings.Contains(content, phrase) {
+				t.Errorf("%s is missing the canonical preserve-gate-fix guidance phrase %q", name, phrase)
+			}
+		}
+	}
+}
+
+func TestBranchSyncGuidance_SyncedAcrossStaticAndLiveSurfaces(t *testing.T) {
+	surfaces := map[string]string{
+		"skill body":         skill.Markdown(),
+		"agents guide":       readAgentsGuide(t),
+		"live sync guidance": branchSyncAgentGuidance,
+	}
+	for name, content := range surfaces {
+		for _, phrase := range canonicalBranchSyncPhrases {
+			if !strings.Contains(content, phrase) {
+				t.Errorf("%s is missing branch-sync guidance phrase %q", name, phrase)
+			}
+		}
+	}
+}
+
+func TestPipelineAgentPrerequisiteGuidance_SyncedAcrossSurfaces(t *testing.T) {
+	surfaces := map[string]string{
+		"skill body":   skill.Markdown(),
+		"agents guide": readAgentsGuide(t),
+		"axi run help": newAxiRunCmd().Long,
+	}
+	for name, content := range surfaces {
+		normalized := strings.Join(strings.Fields(content), " ")
+		if !strings.Contains(normalized, canonicalPipelineAgentPrerequisite) {
+			t.Errorf("%s is missing the canonical pipeline-agent prerequisite %q", name, canonicalPipelineAgentPrerequisite)
+		}
+	}
+}
+
+func TestGateStepBoundaryGuidance_SyncedAcrossSurfaces(t *testing.T) {
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	_ = emitGateContextRefusal(cmd, gatecontext.Result{Nested: true, RunID: "run-1", Phase: types.StepDocument})
+	surfaces := map[string]string{
+		"prompt boundary": gateguidance.PromptBoundary("document"),
+		"skill body":      skill.Markdown(),
+		"agents guide":    readAgentsGuide(t),
+		"live refusal":    out.String(),
+	}
+	phrases := []string{"assigned phase", "outer executor", "push", "PR", "CI"}
+	for name, content := range surfaces {
+		for _, phrase := range phrases {
+			if !strings.Contains(content, phrase) {
+				t.Errorf("%s is missing gate-step boundary phrase %q", name, phrase)
+			}
+		}
+	}
+	for _, name := range []string{"skill body", "agents guide", "live refusal"} {
+		if !strings.Contains(surfaces[name], "nested_gate_context") {
+			t.Errorf("%s is missing structured nested-context error code", name)
+		}
+	}
+}
+
+func TestNormalDriveOutputDoesNotFloodBranchSyncGuidance(t *testing.T) {
+	got := renderDriveResultForGuidanceTest(t, true, types.RunRunning)
+	if strings.Contains(got, branchSyncAgentGuidance) || strings.Contains(got, "branch_sync.next_action") {
+		t.Fatalf("ordinary drive output included irrelevant branch-sync guidance:\n%s", got)
+	}
+}
+
+func TestPreserveGateFixGuidance_InPointOfUseOutputs(t *testing.T) {
+	gate := stepView{
+		Name:   "review",
+		Status: "awaiting_approval",
+		FindingsJSON: findingsJSON(t, []types.Finding{
+			{ID: "review-1", Severity: "warning", File: "main.go", Action: types.ActionAskUser, Description: "calls os.Exit"},
+		}, "1 blocking issue"),
+	}
+	surfaces := map[string]string{
+		"gate output":          axiDoc(gateFields(gate)...),
+		"checks-passed output": renderDriveResultForGuidanceTest(t, true, types.RunRunning),
+		"failed output":        renderDriveResultForGuidanceTest(t, false, types.RunFailed),
+	}
+	for name, content := range surfaces {
+		for _, phrase := range canonicalPreserveGateFixPhrases {
+			if !strings.Contains(content, phrase) {
+				t.Errorf("%s is missing the canonical preserve-gate-fix guidance phrase %q in:\n%s", name, phrase, content)
+			}
+		}
+	}
+}
+
+func renderDriveResultForGuidanceTest(t *testing.T, ciReady bool, status types.RunStatus) string {
+	t.Helper()
+	run := &ipc.RunInfo{
+		ID:      "run-1",
+		Branch:  "feature/x",
+		Status:  status,
+		HeadSHA: "abcdef1234567890",
+		PRURL:   strptr("https://github.com/user/repo/pull/42"),
+		Steps: []ipc.StepResultInfo{
+			{StepName: types.StepCI, Status: types.StepStatusRunning},
+		},
+	}
+
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	err := renderDriveResult(cmd, run, ciReady)
+	var exit *exitError
+	if err != nil && !errors.As(err, &exit) {
+		t.Fatalf("renderDriveResult returned unexpected error: %v", err)
+	}
+	return out.String()
 }
 
 func readAgentsGuide(t *testing.T) string {

@@ -14,15 +14,18 @@ import (
 )
 
 // copilotAgent spawns the GitHub Copilot CLI for each invocation. Copilot
-// runs non-interactively with `copilot -p <prompt> --output-format json`,
+// runs non-interactively with the prompt on stdin and `--output-format json`,
 // emitting JSONL events on stdout. The lifecycle is codex/pi-shaped: one
 // process per Run, no managed server.
 type copilotAgent struct {
 	bin       string
 	extraArgs []string
+	subprocessContext
 }
 
 func (a *copilotAgent) Name() string { return "copilot" }
+
+func (a *copilotAgent) ReportsAgentAttempts() bool { return true }
 
 func (a *copilotAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
 	return runWithRetry(ctx, "copilot", opts, claudeMaxRetries, classifyTransient, nil, func() (*Result, error) {
@@ -34,11 +37,11 @@ func (a *copilotAgent) Close() error { return nil }
 
 func (a *copilotAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) {
 	prompt := buildCopilotPrompt(opts.Prompt, opts.JSONSchema)
-	args := a.buildArgs(prompt)
+	args := a.buildArgs()
 	cmd := exec.CommandContext(ctx, a.bin, args...)
 	cmd.Dir = opts.CWD
-	cmd.Stdin = nil
-	cmd.Env = gitSafeEnv(opts.CWD)
+	cmd.Stdin = strings.NewReader(prompt)
+	cmd.Env = a.gitSafeEnv(opts.CWD, opts.Env)
 	shellenv.ConfigureShellCommand(cmd)
 
 	var stderrBuf []byte
@@ -48,6 +51,8 @@ func (a *copilotAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, erro
 		return nil, fmt.Errorf("copilot start: %w", err)
 	}
 	defer started.closePipes()
+	pid := started.pid()
+	emitAgentStarted(opts, "copilot", pid)
 
 	stderrWG.Add(1)
 	go func() {
@@ -62,7 +67,9 @@ func (a *copilotAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, erro
 	if err := parseCopilotEvents(ctx, started.stdout, opts.OnChunk, &usage, &messages, &copilotErr, &exitCode); err != nil {
 		err = started.waitAfterParseError(err)
 		stderrWG.Wait()
-		return nil, fmt.Errorf("copilot parse events: %w", err)
+		retErr := fmt.Errorf("copilot parse events: %w", err)
+		emitAgentExited(opts, "copilot", pid, retErr)
+		return nil, retErr
 	}
 
 	waitErr := started.wait()
@@ -71,18 +78,28 @@ func (a *copilotAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, erro
 	detail := copilotErrorDetail(copilotErr, string(stderrBuf))
 	if waitErr != nil {
 		if detail != "" {
-			return nil, fmt.Errorf("copilot exited: %w: %s", waitErr, detail)
+			retErr := fmt.Errorf("copilot exited: %w: %s", waitErr, detail)
+			emitAgentExited(opts, "copilot", pid, retErr)
+			return nil, retErr
 		}
-		return nil, fmt.Errorf("copilot exited: %w", waitErr)
+		retErr := fmt.Errorf("copilot exited: %w", waitErr)
+		emitAgentExited(opts, "copilot", pid, retErr)
+		return nil, retErr
 	}
 	if exitCode != 0 {
 		if detail != "" {
-			return nil, fmt.Errorf("copilot reported exit code %d: %s", exitCode, detail)
+			retErr := fmt.Errorf("copilot reported exit code %d: %s", exitCode, detail)
+			emitAgentExited(opts, "copilot", pid, retErr)
+			return nil, retErr
 		}
-		return nil, fmt.Errorf("copilot reported exit code %d", exitCode)
+		retErr := fmt.Errorf("copilot reported exit code %d", exitCode)
+		emitAgentExited(opts, "copilot", pid, retErr)
+		return nil, retErr
 	}
 
-	return finalizeCopilotResult(messages, opts.JSONSchema, usage)
+	res, err := finalizeCopilotResult(messages, opts.JSONSchema, usage)
+	emitAgentExited(opts, "copilot", pid, err)
+	return res, err
 }
 
 // finalizeCopilotResult converts the assistant messages emitted during a run
@@ -127,11 +144,10 @@ func copilotErrorDetail(copilotErr, stderr string) string {
 // supplied their own permission flag, the default --allow-all-tools is not
 // added; --no-ask-user is always added so the agent never blocks waiting for
 // interactive input.
-func (a *copilotAgent) buildArgs(prompt string) []string {
-	args := make([]string, 0, len(a.extraArgs)+8)
+func (a *copilotAgent) buildArgs() []string {
+	args := make([]string, 0, len(a.extraArgs)+6)
 	args = append(args, a.extraArgs...)
 	args = append(args,
-		"-p", prompt,
 		"--output-format", "json",
 		"--no-color",
 	)
@@ -256,7 +272,7 @@ func parseCopilotEvents(
 			if event.Data == nil {
 				continue
 			}
-			usage.Add(TokenUsage{OutputTokens: event.Data.OutputTokens})
+			usage.Add(TokenUsage{OutputTokens: event.Data.OutputTokens, Reported: true})
 			if event.Data.Content != "" && messages != nil {
 				*messages = append(*messages, event.Data.Content)
 			}

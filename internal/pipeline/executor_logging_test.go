@@ -2,13 +2,17 @@ package pipeline
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -52,6 +56,160 @@ func TestExecutor_LogCallback(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected log message 'hello from review' in events, got: %v", logMessages)
+	}
+}
+
+func TestExecutor_LogCallbackTouchesStepActivity(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	step := &adaptiveCallStep{
+		name: types.StepReview,
+		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			sctx.Log("heartbeat marker")
+			got, err := database.GetStepResult(sctx.StepResultID)
+			if err != nil {
+				t.Fatalf("get step result: %v", err)
+			}
+			if got.LastActivity == nil || !strings.Contains(*got.LastActivity, "heartbeat marker") {
+				t.Fatalf("last_activity = %v, want heartbeat marker", got.LastActivity)
+			}
+			return &StepOutcome{ExitCode: 0}, nil
+		},
+	}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+}
+
+func TestExecutor_LogChunkThrottlesStepActivityWrites(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	counterDB, err := sql.Open("sqlite", p.DB()+"?_pragma=journal_mode(wal)&_pragma=foreign_keys(on)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open counter db: %v", err)
+	}
+	defer counterDB.Close()
+	if _, err := counterDB.Exec(`
+		CREATE TABLE step_activity_update_count (n INTEGER NOT NULL);
+		INSERT INTO step_activity_update_count (n) VALUES (0);
+		CREATE TRIGGER count_step_activity_update AFTER UPDATE OF last_activity_at, last_activity ON step_results
+		BEGIN
+			UPDATE step_activity_update_count SET n = n + 1;
+		END;
+	`); err != nil {
+		t.Fatalf("install activity counter: %v", err)
+	}
+
+	step := &adaptiveCallStep{
+		name: types.StepReview,
+		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			for i := 0; i < 100; i++ {
+				sctx.LogChunk(fmt.Sprintf("delta-%03d ", i))
+			}
+			return &StepOutcome{ExitCode: 0}, nil
+		},
+	}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	var updates int
+	if err := counterDB.QueryRow(`SELECT n FROM step_activity_update_count`).Scan(&updates); err != nil {
+		t.Fatalf("read activity update count: %v", err)
+	}
+	if updates > 5 {
+		t.Fatalf("step activity updates = %d, want throttled count <= 5", updates)
+	}
+}
+
+func TestStepActivityFromLogUsesBoundedAllocationForLargeLogs(t *testing.T) {
+	lastLine := strings.Repeat("x", maxStepActivityText+100)
+	largeLog := strings.Repeat("noise line\n", 8192) + lastLine + "\n\n"
+	want := "log: " + strings.Repeat("x", maxStepActivityText) + "..."
+
+	if got := stepActivityFromLog(largeLog); got != want {
+		t.Fatalf("stepActivityFromLog() = %q, want %q", got, want)
+	}
+
+	oldGC := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(oldGC)
+	runtime.GC()
+
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	const iterations = 25
+	for i := 0; i < iterations; i++ {
+		if got := stepActivityFromLog(largeLog); got != want {
+			t.Fatalf("stepActivityFromLog() = %q, want %q", got, want)
+		}
+	}
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+
+	allocatedPerCall := (after.TotalAlloc - before.TotalAlloc) / iterations
+	if allocatedPerCall > 4*1024 {
+		t.Fatalf("stepActivityFromLog allocated %d bytes per call, want <= 4096", allocatedPerCall)
+	}
+}
+
+type lifecycleTestAgent struct{}
+
+func (lifecycleTestAgent) Name() string { return "codex" }
+
+func (lifecycleTestAgent) Run(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	if opts.OnLifecycle != nil {
+		opts.OnLifecycle(agent.LifecycleEvent{Agent: "codex", Phase: "start", PID: 4242, Message: "codex started pid=4242"})
+		opts.OnLifecycle(agent.LifecycleEvent{Agent: "codex", Phase: "exit", PID: 4242, Message: "codex exited pid=4242 status=success"})
+	}
+	return &agent.Result{Text: "ok"}, nil
+}
+
+func (lifecycleTestAgent) Close() error { return nil }
+
+func TestExecutor_AgentLifecycleLoggedAndClearsPID(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	step := &adaptiveCallStep{
+		name: types.StepReview,
+		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			if _, err := sctx.Agent.Run(sctx.Ctx, agent.RunOpts{Prompt: "work", CWD: sctx.WorkDir}); err != nil {
+				t.Fatalf("agent run: %v", err)
+			}
+			return &StepOutcome{ExitCode: 0}, nil
+		},
+	}
+
+	exec := NewExecutor(database, p, nil, lifecycleTestAgent{}, []Step{step}, nil)
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	logPath := filepath.Join(p.RunLogDir(run.ID), "review.log")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	content := string(data)
+	for _, want := range []string{"codex started pid=4242", "codex exited pid=4242 status=success"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("log missing %q in:\n%s", want, content)
+		}
+	}
+	steps, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatalf("get steps: %v", err)
+	}
+	if steps[0].AgentPID != nil {
+		t.Fatalf("agent pid = %v, want nil after exit", steps[0].AgentPID)
 	}
 }
 
@@ -183,6 +341,66 @@ func TestExecutor_LogFileWritten_OnStepError(t *testing.T) {
 	}
 	if !strings.Contains(string(data), stepErr.Error()) {
 		t.Errorf("expected push log to contain the step error %q, got: %s", stepErr.Error(), data)
+	}
+}
+
+func TestExecutor_StepErrorRedactsCredentialURL(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	// A step error carrying a credentialled upstream URL (as a real git push
+	// rejection error would). It must be redacted before reaching the step log
+	// file, the DB error column, the returned executor error, and the IPC event.
+	const token = "ghp_secret_DO_NOT_LEAK"
+	credURL := "https://x-access-token:" + token + "@github.com/o/r.git"
+	stepErr := fmt.Errorf("push to upstream: git push %s: remote rejected: file exceeds 100.00 MB", credURL)
+
+	ec := &eventCollector{}
+	exec := NewExecutor(database, p, nil, nil, []Step{newFailStep(types.StepPush, stepErr)}, ec.handler)
+	err := exec.Execute(context.Background(), run, repo, workDir)
+	if err == nil {
+		t.Fatal("expected error from failing step")
+	}
+
+	// 1) Step log file must contain the redacted form, never the token.
+	logPath := filepath.Join(p.RunLogDir(run.ID), "push.log")
+	data, rerr := os.ReadFile(logPath)
+	if rerr != nil {
+		t.Fatalf("expected log file at %s: %v", logPath, rerr)
+	}
+	logContent := string(data)
+	if strings.Contains(logContent, token) {
+		t.Errorf("step log leaked credential: %s", logContent)
+	}
+	if !strings.Contains(logContent, "redacted@github.com/o/r.git") {
+		t.Errorf("step log missing redacted URL, got: %s", logContent)
+	}
+
+	// 2) DB step error column must not carry the token.
+	steps, _ := database.GetStepsByRun(run.ID)
+	if steps[0].Error == nil {
+		t.Fatal("expected step error to be persisted")
+	}
+	dbErr := *steps[0].Error
+	if strings.Contains(dbErr, token) {
+		t.Errorf("DB step error leaked credential: %q", dbErr)
+	}
+	if !strings.Contains(dbErr, "redacted@github.com/o/r.git") {
+		t.Errorf("DB step error missing redacted URL, got: %q", dbErr)
+	}
+
+	// 3) Returned executor error must not carry the token.
+	if strings.Contains(err.Error(), token) {
+		t.Errorf("returned error leaked credential: %q", err.Error())
+	}
+
+	// 4) IPC step-completed event error must not carry the token.
+	ev := ec.find(ipc.EventStepCompleted, types.StepPush)
+	if ev == nil {
+		t.Fatal("expected step completed event")
+	}
+	if ev.Error != nil && strings.Contains(*ev.Error, token) {
+		t.Errorf("IPC event error leaked credential: %q", *ev.Error)
 	}
 }
 

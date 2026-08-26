@@ -65,6 +65,21 @@ func TestClassifyTransient_Positive(t *testing.T) {
 			errMsg:  `Post "https://api.anthropic.com": net/http: TLS handshake timeout`,
 			wantSub: "tls",
 		},
+		{
+			name:    "prose turn ending",
+			errMsg:  `antigravity output parse: ended its turn with prose instead of the required JSON object`,
+			wantSub: "prose",
+		},
+		{
+			name:    "agy permission declaration",
+			errMsg:  `antigravity reported error: declaring permissions: cortex tool view_file: failed`,
+			wantSub: "permission",
+		},
+		{
+			name:    "invalid tool call",
+			errMsg:  `antigravity reported error: invalid tool call error (invalid_args)`,
+			wantSub: "tool call",
+		},
 	}
 
 	for _, tc := range cases {
@@ -105,12 +120,45 @@ func TestClassifyTransient_Negative(t *testing.T) {
 			name:   "schema validation",
 			errMsg: `JSON output missing required field "summary"`,
 		},
+		{
+			name:   "free usage limit",
+			errMsg: `API rate limit reached with HTTP 429: FreeUsageLimit exceeded`,
+		},
+		{
+			name:   "quota exhausted",
+			errMsg: `provider error: quota_exhausted`,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if label, ok := classifyTransient(errors.New(tc.errMsg)); ok {
 				t.Errorf("expected non-transient for %q, got %q", tc.errMsg, label)
+			}
+		})
+	}
+}
+
+func TestRunWithRetry_DoesNotRetryQuotaExhaustion(t *testing.T) {
+	defer withFastBackoff(t)()
+
+	for _, message := range []string{
+		"API rate limit reached with HTTP 429: FreeUsageLimit exceeded",
+		"API request failed with HTTP 429: insufficient_quota",
+		"API request failed with HTTP 429: You exceeded your current quota",
+	} {
+		t.Run(message, func(t *testing.T) {
+			calls := 0
+			quotaErr := errors.New(message)
+			_, err := runWithRetry(context.Background(), "antigravity", RunOpts{}, 3, classifyTransient, nil, func() (*Result, error) {
+				calls++
+				return nil, quotaErr
+			})
+			if !errors.Is(err, quotaErr) {
+				t.Fatalf("expected quota error to propagate, got %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("expected one call for quota exhaustion, got %d", calls)
 			}
 		})
 	}
@@ -150,7 +198,11 @@ func TestRunWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 	calls := 0
 	transientErr := fmt.Errorf("API Error: overloaded_error: please retry")
 	var chunks []string
-	opts := RunOpts{OnChunk: func(s string) { chunks = append(chunks, s) }}
+	var attempts []Attempt
+	opts := RunOpts{
+		OnChunk:   func(s string) { chunks = append(chunks, s) },
+		OnAttempt: func(attempt Attempt) { attempts = append(attempts, attempt) },
+	}
 
 	res, err := runWithRetry(context.Background(), "claude", opts, 3, classifyTransient, nil, func() (*Result, error) {
 		calls++
@@ -168,6 +220,20 @@ func TestRunWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 	if calls != 3 {
 		t.Errorf("expected 3 calls (2 retries + success), got %d", calls)
 	}
+	if len(attempts) != 3 {
+		t.Fatalf("attempts = %d, want 3", len(attempts))
+	}
+	for i, attempt := range attempts {
+		if attempt.Agent != "claude" || attempt.StartedAt.IsZero() || attempt.CompletedAt.IsZero() {
+			t.Fatalf("attempt %d = %+v", i, attempt)
+		}
+		if i < 2 && attempt.Err == nil {
+			t.Fatalf("attempt %d must preserve the transient error", i)
+		}
+	}
+	if attempts[2].Result == nil || attempts[2].Result.Text != "ok" {
+		t.Fatalf("successful attempt = %+v", attempts[2])
+	}
 	if len(chunks) < 2 {
 		t.Errorf("expected at least 2 retry notification chunks, got %d: %v", len(chunks), chunks)
 	}
@@ -175,6 +241,41 @@ func TestRunWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 		if !strings.Contains(strings.ToLower(c), "transient") || !strings.Contains(strings.ToLower(c), "overloaded") {
 			t.Errorf("chunk[%d]=%q should mention 'transient' and the classification label", i, c)
 		}
+	}
+}
+
+func TestRunWithRetry_EmitsRetryLifecycleWhenConfigured(t *testing.T) {
+	defer withFastBackoff(t)()
+
+	calls := 0
+	var chunks []string
+	var events []LifecycleEvent
+	opts := RunOpts{
+		OnChunk:     func(s string) { chunks = append(chunks, s) },
+		OnLifecycle: func(e LifecycleEvent) { events = append(events, e) },
+	}
+
+	_, err := runWithRetry(context.Background(), "codex", opts, 1, classifyTransient, nil, func() (*Result, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("API Error: 503 overloaded")
+		}
+		return &Result{Text: "ok"}, nil
+	})
+	if err != nil {
+		t.Fatalf("expected success after retry, got %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %v, want one retry lifecycle event", events)
+	}
+	if events[0].Agent != "codex" || events[0].Phase != LifecyclePhaseRetry {
+		t.Fatalf("event = %+v, want codex retry", events[0])
+	}
+	if !strings.Contains(events[0].Message, "attempt 2/2") || !strings.Contains(events[0].Message, "503") {
+		t.Fatalf("retry message = %q, want attempt and label", events[0].Message)
+	}
+	if len(chunks) != 0 {
+		t.Fatalf("OnChunk should not duplicate retry lifecycle events, got %v", chunks)
 	}
 }
 

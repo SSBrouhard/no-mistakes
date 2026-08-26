@@ -77,7 +77,7 @@ var testFindingsSchema = json.RawMessage(`{
 				"properties": {
 					"kind": {"type": "string", "description": "artifact type such as screenshot, gif, image, video, log, command-output, or other"},
 					"label": {"type": "string"},
-					"path": {"type": "string", "description": "artifact file path, including absolute paths for temporary local evidence files when available"},
+					"path": {"type": "string", "description": "artifact file path: repository-relative for a file inside the repository, or the full path to the file in this run's evidence directory for an evidence file. Do not report a path from anywhere else on the machine."},
 					"url": {"type": "string", "description": "artifact URL when available"},
 					"content": {"type": "string", "description": "short log, command output, or textual artifact content to show inline"}
 				},
@@ -103,9 +103,10 @@ var reviewFindingsSchema = json.RawMessage(`{
 					"file": {"type": "string"},
 					"line": {"type": "integer"},
 					"description": {"type": "string"},
-					"action": {"type": "string", "enum": ["no-op", "auto-fix", "ask-user"]}
+					"action": {"type": "string", "enum": ["no-op", "auto-fix", "ask-user"]},
+					"review_scope": {"type": "string", "enum": ["source", "pipeline-owned-delivery", "external-delivery"]}
 				},
-				"required": ["severity", "description", "action"]
+				"required": ["severity", "description", "action", "review_scope"]
 			}
 		},
 		"tested": {
@@ -116,9 +117,10 @@ var reviewFindingsSchema = json.RawMessage(`{
 			"type": "string"
 		},
 		"risk_level": {"type": "string", "enum": ["low", "medium", "high"]},
-		"risk_rationale": {"type": "string"}
+		"risk_rationale": {"type": "string"},
+		"risk_scope": {"type": "string", "enum": ["source-or-external", "pipeline-owned-delivery"]}
 	},
-	"required": ["findings", "risk_level", "risk_rationale"]
+	"required": ["findings", "risk_level", "risk_rationale", "risk_scope"]
 }`)
 
 // AllSteps returns the fixed pipeline step sequence.

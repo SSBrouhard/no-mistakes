@@ -7,8 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"reflect"
 	"strings"
+	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/agentcfg"
+	"github.com/kunchenguid/no-mistakes/internal/runenv"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -21,10 +26,166 @@ type Agent interface {
 
 // RunOpts configures a single agent invocation.
 type RunOpts struct {
-	Prompt     string
-	CWD        string
-	JSONSchema json.RawMessage   // structured output schema (optional)
-	OnChunk    func(text string) // streaming text callback (optional)
+	Prompt string
+	// Env appends invocation-scoped environment entries to the agent process.
+	// Entries later in the slice override inherited values.
+	Env         []string
+	CWD         string
+	JSONSchema  json.RawMessage      // structured output schema (optional)
+	OnChunk     func(text string)    // streaming text callback (optional)
+	OnLifecycle func(LifecycleEvent) // native agent lifecycle callback (optional)
+	// Session, when non-nil, asks a session-capable adapter (see
+	// SessionResumer) to start or resume a durable native session. Adapters
+	// without session support ignore it and run cold; the caller detects the
+	// fallback via an empty Result.SessionID.
+	Session *SessionRef
+	// SessionFallback marks this invocation as the fresh-session retry after
+	// a failed resume. Instrumentation only; adapters ignore it.
+	SessionFallback bool
+	// Purpose labels the pipeline duty this invocation serves (review,
+	// review-fix, test-evidence, ...). Instrumentation only; adapters
+	// ignore it.
+	Purpose string
+	// SessionFallbackReason is the low-cardinality reason a failed resume forced
+	// this fresh-session retry (see db.FallbackReason*). Set only when
+	// SessionFallback is true. Instrumentation only; adapters ignore it.
+	SessionFallbackReason string
+	// Workload, when non-nil, records the bounded size of the change this
+	// invocation is working over (files and net lines), so review/fix telemetry
+	// can be normalized without external git archaeology. Instrumentation only;
+	// adapters ignore it.
+	Workload *InvocationWorkload
+	// OnAttempt receives each concrete adapter attempt, including retries and
+	// fallback-provider attempts, after it completes. It is instrumentation
+	// only and must not change invocation behavior.
+	OnAttempt func(Attempt)
+}
+
+// Attempt describes one completed concrete adapter attempt for an agent
+// invocation. An Agent may make several attempts when it retries transient
+// failures or moves to a fallback provider.
+type Attempt struct {
+	Agent           string
+	Result          *Result
+	Err             error
+	StartedAt       time.Time
+	CompletedAt     time.Time
+	Session         *SessionRef
+	SessionFallback bool
+}
+
+// SessionRef identifies a durable adapter-native session for RunOpts.Session.
+type SessionRef struct {
+	// ID is the adapter-native session identity to resume. Empty starts a
+	// new resumable session whose identity is reported via Result.SessionID.
+	ID    string
+	Agent string
+}
+
+// SessionResumer is the optional adapter capability for durable native
+// session resume across invocations. Decorators must forward it; callers use
+// SupportsSessionResume so wrapping never hides the capability.
+type SessionResumer interface {
+	SupportsSessionResume() bool
+}
+
+// SupportsSessionResume reports whether a (possibly wrapped) agent can start
+// and resume durable native sessions.
+func SupportsSessionResume(a Agent) bool {
+	r, ok := a.(SessionResumer)
+	return ok && r.SupportsSessionResume()
+}
+
+// SessionProviderMatcher reports whether an agent can resume sessions minted
+// by a particular provider. Fallback wrappers implement it so callers do not
+// mistake the wrapper's name for the provider that owns a session identity.
+type SessionProviderMatcher interface {
+	SupportsSessionProvider(string) bool
+}
+
+// SupportsSessionProvider reports whether a (possibly wrapped) agent can
+// resume a session minted by provider.
+func SupportsSessionProvider(a Agent, provider string) bool {
+	if provider == "" {
+		return false
+	}
+	if matcher, ok := a.(SessionProviderMatcher); ok {
+		return matcher.SupportsSessionProvider(provider)
+	}
+	return a != nil && a.Name() == provider && SupportsSessionResume(a)
+}
+
+// AttemptReporter is the optional adapter capability for reporting every
+// concrete attempt, including internal retries and fallback providers.
+type AttemptReporter interface {
+	ReportsAgentAttempts() bool
+}
+
+// ReportsAgentAttempts reports whether a (possibly wrapped) agent emits an
+// Attempt callback for each concrete adapter attempt.
+func ReportsAgentAttempts(a Agent) bool {
+	r, ok := a.(AttemptReporter)
+	return ok && r.ReportsAgentAttempts()
+}
+
+// GateInstructionNeutralizer is the optional adapter capability that reports the
+// adapter neutralizes the target repository's project agent-instruction files
+// (AGENTS.md/CLAUDE.md) for this invocation, so they cannot install a governing
+// identity on the gate agent.
+//
+// A gate agent runs with cmd.Dir set to the target checkout and a free shell. If
+// the checkout is itself an agent-orchestration harness (for example firstmate),
+// its AGENTS.md can otherwise convince the gate agent it is the fleet captain and
+// drive it to spawn a crew and reset the branch it is validating (the
+// ambient-authority incident). Only adapters whose suppression knob is
+// empirically verified implement this and return true, and only while that knob
+// is actually in effect for the invocation (an operator override that defeats the
+// knob must report false so the gate fails closed rather than launching
+// unneutralized).
+type GateInstructionNeutralizer interface {
+	NeutralizesGateInstructions() bool
+}
+
+// NeutralizesGateInstructions reports whether a (possibly wrapped) agent
+// neutralizes the target repo's project agent-instruction files during a gate
+// run. It fails closed: an adapter that does not implement the capability, a
+// nil agent, or a wrapper any member of which does not neutralize, is reported
+// as NOT neutralized.
+func NeutralizesGateInstructions(a Agent) bool {
+	if a == nil {
+		return false
+	}
+	n, ok := a.(GateInstructionNeutralizer)
+	return ok && n.NeutralizesGateInstructions()
+}
+
+// EnsureGateNeutralized fails closed when the agent that will run gate steps in
+// the target checkout does not neutralize that checkout's project
+// agent-instruction files. Callers must invoke it before launching any gate
+// agent so an unverified harness is refused with a clear error rather than run
+// unneutralized in the target checkout. Codex, claude, pi, and grok (only when
+// --no-context-files is actually in force) have a verified neutralization knob.
+func EnsureGateNeutralized(a Agent) error {
+	if a == nil {
+		return fmt.Errorf("no gate agent configured")
+	}
+	if NeutralizesGateInstructions(a) {
+		return nil
+	}
+	return fmt.Errorf("gate agent %q does not neutralize the target repository's project "+
+		"agent-instruction files (AGENTS.md/CLAUDE.md); refusing to launch it in the target "+
+		"checkout. Only codex, claude, pi, and grok with --no-context-files have a verified neutralization knob (and only when it "+
+		"is not overridden by agent_args_override); set 'agent' to a verified harness in "+
+		"~/.no-mistakes/config.yaml", a.Name())
+}
+
+// LifecycleEvent describes process-level activity for an agent invocation.
+// The pipeline records these as step log lines and active-step heartbeats.
+type LifecycleEvent struct {
+	Agent   string
+	Phase   string
+	PID     int
+	Message string
 }
 
 // Result holds the output of an agent invocation.
@@ -36,7 +197,36 @@ type Result struct {
 	// Text is the raw text output.
 	Text string
 	// Usage tracks token consumption for the invocation.
-	Usage TokenUsage
+	Usage         TokenUsage
+	UsageReported bool
+	// SessionID is the adapter-native session identity of this invocation
+	// when the adapter reports one. Callers persist it to resume later.
+	SessionID string
+	// Resumed reports whether this invocation resumed opts.Session.ID.
+	Resumed bool
+	// Model is the model the adapter reported serving this invocation, when
+	// available. Instrumentation only.
+	Model string
+	// ModelProvider is the provider that served the model (e.g. "openai",
+	// "anthropic"), when the adapter can report it. Instrumentation only.
+	ModelProvider string
+	// Provider is the adapter provider that served this invocation. It lets
+	// fallback wrappers persist a session against the provider that minted it.
+	Provider string
+	// Metrics is the bounded per-invocation activity evidence the adapter
+	// extracted from its event stream (round-trips, tool calls + categories,
+	// subprocess wait time). Nil means the adapter reported nothing, which is
+	// recorded as unknown (NULL) rather than a fabricated zero.
+	Metrics *InvocationMetrics
+	// CacheCreationReported reports whether Usage.CacheCreationTokens is a
+	// meaningful value. Adapters whose provider does not surface cache-creation
+	// cost (codex) leave it false so the field is recorded as unknown instead of
+	// a fabricated zero.
+	CacheCreationReported bool
+	// SessionUsageCumulative reports that Usage accumulates across a resumed
+	// durable session, so round N's counters include rounds 1..N-1. The pipeline
+	// uses it to record correct per-round token deltas (see PerRoundTokens).
+	SessionUsageCumulative bool
 }
 
 // TokenUsage tracks token consumption for an agent invocation.
@@ -45,12 +235,43 @@ type TokenUsage struct {
 	OutputTokens        int
 	CacheReadTokens     int
 	CacheCreationTokens int
+	// ReasoningTokens is the output tokens the model spent on hidden reasoning,
+	// when the provider reports it separately. Zero when not reported.
+	ReasoningTokens int
+	// ReasoningReported distinguishes a genuine zero from an adapter that does
+	// not expose reasoning usage.
+	ReasoningReported     bool
+	Reported              bool
+	CacheCreationReported bool
+}
+
+// InvocationWorkload is the bounded size of the change an invocation works
+// over: changed files and net changed lines. It carries no paths or content.
+type InvocationWorkload struct {
+	Files int
+	Lines int
 }
 
 // Options configures backend-specific agent construction behavior.
-// ACPRegistryOverrides maps acpx target names to raw ACP agent commands.
+// ACPRegistryOverrides maps acpx target names, including first-class alias
+// targets, to raw ACP agent commands.
 type Options struct {
 	ACPRegistryOverrides map[string]string
+	Environment          runenv.Overlay
+	// DisableProjectSettings, when true, asks a supported adapter (codex,
+	// claude, pi) to launch with the target repo's project-level agent
+	// settings/instructions suppressed. It is the resolved, trusted-only opt-out
+	// from config.Config; adapters without a verified suppression knob ignore it
+	// and are refused separately by EnsureGateNeutralized when the opt-out is on.
+	DisableProjectSettings bool
+	// Profile is the harness-neutral model/effort selection (see
+	// internal/agentcfg). NewWithOptions maps it down to whatever mechanism the
+	// named harness actually uses - injected argv flags for most CLIs, the
+	// session-message body for opencode, acpx's own --model for ACP targets -
+	// and refuses a knob the harness cannot express. A zero Profile leaves every
+	// harness on its own defaults, which is what every configuration that
+	// predates the common layer resolves to.
+	Profile agentcfg.Profile
 }
 
 func finalizeTextResult(agentName, text string, schema json.RawMessage, usage TokenUsage) (*Result, error) {
@@ -58,7 +279,7 @@ func finalizeTextResult(agentName, text string, schema json.RawMessage, usage To
 		return nil, fmt.Errorf("%s returned no text output", agentName)
 	}
 	if len(schema) == 0 {
-		return &Result{Text: text, Usage: usage}, nil
+		return &Result{Text: text, Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported}, nil
 	}
 
 	output, err := parseStructuredTextOutput(text, schema)
@@ -66,7 +287,7 @@ func finalizeTextResult(agentName, text string, schema json.RawMessage, usage To
 		return nil, fmt.Errorf("%s output parse: %w (output snippet: %q)", agentName, err, outputSnippet(text))
 	}
 
-	return &Result{Output: output, Text: text, Usage: usage}, nil
+	return &Result{Output: output, Text: text, Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported}, nil
 }
 
 // outputSnippet returns a trimmed, length-capped excerpt of agent output for
@@ -93,35 +314,74 @@ func parseStructuredTextOutput(text string, schema json.RawMessage) (json.RawMes
 		return output, nil
 	}
 
-	candidates := fencedJSONCandidates(text)
-	var parsed []json.RawMessage
+	closed, openCands := fencedJSONCandidates(text)
+
 	var candidateErr error
-	for _, candidate := range candidates {
-		fenced, err := parseStructuredCandidate([]byte(candidate), validationSchema)
-		if err == nil {
-			parsed = append(parsed, fenced)
-			continue
+	parseCandidates := func(cands []string) []json.RawMessage {
+		var parsed []json.RawMessage
+		for _, candidate := range cands {
+			fenced, err := parseStructuredCandidate([]byte(candidate), validationSchema)
+			if err == nil {
+				parsed = append(parsed, fenced)
+				continue
+			}
+			if candidateErr == nil {
+				candidateErr = err
+			}
 		}
-		if candidateErr == nil {
-			candidateErr = err
-		}
+		return parsed
 	}
-	switch len(parsed) {
-	case 0:
-	case 1:
-		return parsed[0], nil
-	default:
+	// Closed fences are the canonical structured-output shape and win over
+	// open (unclosed, pi JSONL) candidates: prose that quotes ```json as an
+	// inline example never shadows a real trailing block, and an unclosed
+	// fence never competes with a closed one. Only when no closed fence
+	// parses do we consult the open candidates.
+	closedParsed := parseCandidates(closed)
+	if len(closedParsed) > 1 {
+		return nil, fmt.Errorf("multiple JSON code fences found in output")
+	}
+	openParsed := parseCandidates(openCands)
+	if len(openParsed) > 1 {
 		return nil, fmt.Errorf("multiple JSON code fences found in output")
 	}
 
-	if bare, err := lastBareJSONObject(text, validationSchema); err == nil && bare != nil {
-		return bare, nil
-	} else if candidateErr == nil && err != nil {
-		candidateErr = err
+	var fenced json.RawMessage
+	if len(closedParsed) == 1 {
+		fenced = closedParsed[0]
+	} else if len(openParsed) == 1 {
+		fenced = openParsed[0]
+	}
+
+	bareParsed, bareErr := bareJSONObjects(text, validationSchema)
+	if len(bareParsed) > 1 {
+		return nil, fmt.Errorf("multiple bare JSON objects found in output")
+	}
+	if fenced != nil && len(bareParsed) == 1 {
+		if !jsonEqual(fenced, bareParsed[0]) {
+			return nil, fmt.Errorf("conflicting JSON candidates found in output")
+		}
+		return fenced, nil
+	}
+	if fenced != nil {
+		return fenced, nil
+	}
+	if len(bareParsed) == 1 {
+		return bareParsed[0], nil
+	}
+	if candidateErr == nil && bareErr != nil {
+		candidateErr = bareErr
 	}
 
 	if candidateErr != nil {
 		return nil, candidateErr
+	}
+	if _, err := decodeJSONValue([]byte(text)); err == nil {
+		return nil, rawErr
+	}
+
+	trimmedText := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmedText, "{") {
+		return nil, fmt.Errorf("ended its turn with prose instead of the required JSON object")
 	}
 	return nil, rawErr
 }
@@ -143,54 +403,87 @@ func textValidationSchema(schema json.RawMessage) (json.RawMessage, error) {
 // Fence markers may appear anywhere in the text, including glued to the end
 // of a preceding line (e.g. "...behavior.```json"), which is a shape real
 // codex/GPT-5 output regularly produces.
-func fencedJSONCandidates(text string) []string {
-	var candidates []string
+//
+// Candidates are split into two groups. closed holds bodies of fences with
+// a matching closing fence (the canonical shape); open holds bodies of
+// fences with no closing fence, where the body runs to the end of the text
+// (the pi JSONL shape). The scan never stops at the first opener: an opener
+// whose candidate spans unrelated prose (e.g. prose quoting ```json as an
+// inline example) must not swallow a later, real fence block.
+func fencedJSONCandidates(text string) (closed, open []string) {
 	rest := text
 	for {
-		start := indexJSONFenceOpen(rest)
-		if start < 0 {
-			return candidates
+		marker := strings.Index(rest, "```")
+		if marker < 0 {
+			return closed, open
 		}
-		body := rest[start:]
-		end, next := indexJSONFenceClose(body)
+		contentStart, info := fenceContentStart(rest, marker)
+		if !strings.EqualFold(strings.TrimSpace(info), "json") {
+			// Not a JSON fence: skip it (or its whole block) and keep
+			// scanning for a real opener.
+			after := skipFenceBlock(rest[contentStart:])
+			if after < 0 {
+				after = 0
+			}
+			rest = rest[contentStart+after:]
+			continue
+		}
+		body := rest[contentStart:]
+		end, _ := indexJSONFenceClose(body)
 		if end < 0 {
-			return candidates
+			// No closing fence: the JSON body runs to the end of the output
+			// (pi JSONL shape). Take everything after the opener as an open
+			// candidate; parseStructuredCandidate validates it later and
+			// only adopts it when it is actually valid JSON.
+			open = append(open, body)
+			return closed, open
 		}
-		candidates = append(candidates, body[:end])
-		rest = body[next:]
+		closed = append(closed, body[:end])
+		// Resume after the opener marker, not after this candidate's closing
+		// fence: an unvalidated candidate may span unrelated text, and a
+		// later real block must still be discovered on its own.
+		rest = rest[marker+3:]
 	}
 }
 
-// indexJSONFenceOpen returns the byte offset of the content immediately
-// following an opening ```json fence (the char after the info line's
-// newline), or -1 if no opener exists.
-func indexJSONFenceOpen(text string) int {
-	for searchStart := 0; searchStart < len(text); {
-		i := strings.Index(text[searchStart:], "```")
-		if i < 0 {
-			return -1
-		}
-		i += searchStart
-		contentStart, info := fenceContentStart(text, i)
-		if strings.EqualFold(strings.TrimSpace(info), "json") {
-			return contentStart
-		}
-		next := skipFenceBlock(text[contentStart:])
-		if next < 0 {
-			return -1
-		}
-		searchStart = contentStart + next
-	}
-	return -1
-}
-
+// fenceContentStart returns the byte offset where a fence's content begins
+// (immediately after the info token and any following newline) plus the
+// parsed info token itself.
 func fenceContentStart(text string, fenceStart int) (int, string) {
 	after := text[fenceStart+3:]
 	lineEnd := strings.IndexByte(after, '\n')
-	if lineEnd < 0 {
-		return fenceStart + 3 + len(after), after
+	if lineEnd >= 0 {
+		after = after[:lineEnd]
 	}
-	return fenceStart + 3 + lineEnd + 1, after[:lineEnd]
+	info, rest := fenceInfoToken(after)
+	start := fenceStart + 3 + rest
+	if start < len(text) && text[start] == '\n' {
+		start++
+	}
+	return start, info
+}
+
+// fenceInfoToken returns the leading info token of a fence line (the part
+// after ```) together with its end offset within s. The token is a word
+// made of letters/digits/`-`/`_`; anything else (whitespace, `{`, `[`, …)
+// terminates it. This tolerates ```json glued directly to a JSON body on
+// the same line (e.g. ```json{"findings":[]}) — a shape real pi JSONL
+// streams produce when content blocks are concatenated without separators.
+func fenceInfoToken(s string) (string, int) {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	start := i
+	for i < len(s) {
+		c := s[i]
+		isWord := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_'
+		if !isWord {
+			break
+		}
+		i++
+	}
+	return s[start:i], i
 }
 
 func skipFenceBlock(text string) int {
@@ -248,18 +541,26 @@ func indexJSONFenceClose(text string) (int, int) {
 	return -1, -1
 }
 
-// lastBareJSONObject scans text for balanced {...} substrings that parse
-// as JSON and returns the last one found. This handles models that emit
-// reasoning prose followed by a raw JSON answer, with no code fence.
-func lastBareJSONObject(text string, schema json.RawMessage) (json.RawMessage, error) {
-	var last json.RawMessage
+// bareJSONObjects scans text for balanced {...} substrings outside code fences
+// that parse as JSON and validate against the schema. Only concluding objects
+// are candidates; an incidental object followed by substantive prose is not a
+// verdict.
+func bareJSONObjects(text string, schema json.RawMessage) ([]json.RawMessage, error) {
+	var valid []struct {
+		obj      json.RawMessage
+		endIndex int
+	}
 	var lastErr error
 	for i := 0; i < len(text); i++ {
 		if strings.HasPrefix(text[i:], "```") {
 			contentStart, _ := fenceContentStart(text, i)
 			next := skipFenceBlock(text[contentStart:])
 			if next < 0 {
-				break
+				// An unpaired fence marker (e.g. ```json quoted inside prose)
+				// must not abort the scan of the whole output; skip the marker
+				// itself and keep looking for a bare object.
+				i += 2
+				continue
 			}
 			i = contentStart + next - 1
 			continue
@@ -274,17 +575,170 @@ func lastBareJSONObject(text string, schema json.RawMessage) (json.RawMessage, e
 		candidate := text[i:end]
 		obj, err := parseStructuredCandidate([]byte(candidate), schema)
 		if err == nil {
-			last = obj
+			valid = append(valid, struct {
+				obj      json.RawMessage
+				endIndex int
+			}{obj: obj, endIndex: end})
 			lastErr = nil
 		} else if lastErr == nil {
 			lastErr = err
 		}
 		i = end - 1
 	}
-	if last != nil {
-		return last, nil
+	if len(valid) > 1 {
+		objects := make([]json.RawMessage, 0, len(valid))
+		for _, candidate := range valid {
+			objects = append(objects, candidate.obj)
+		}
+		return objects, nil
+	}
+	if len(valid) == 1 && strings.TrimSpace(text[valid[0].endIndex:]) == "" {
+		return []json.RawMessage{valid[0].obj}, nil
 	}
 	return nil, lastErr
+}
+
+func jsonEqual(a, b json.RawMessage) bool {
+	if bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b)) {
+		return true
+	}
+	valA, err := decodeJSONValue(a)
+	if err != nil {
+		return false
+	}
+	valB, err := decodeJSONValue(b)
+	if err != nil {
+		return false
+	}
+	return jsonValuesEqual(valA, valB)
+}
+
+func jsonValuesEqual(a, b any) bool {
+	switch valueA := a.(type) {
+	case json.Number:
+		valueB, ok := b.(json.Number)
+		if !ok {
+			return false
+		}
+		return jsonNumbersEqual(valueA, valueB)
+	case map[string]any:
+		valueB, ok := b.(map[string]any)
+		if !ok || len(valueA) != len(valueB) {
+			return false
+		}
+		for key, childA := range valueA {
+			childB, ok := valueB[key]
+			if !ok || !jsonValuesEqual(childA, childB) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		valueB, ok := b.([]any)
+		if !ok || len(valueA) != len(valueB) {
+			return false
+		}
+		for i := range valueA {
+			if !jsonValuesEqual(valueA[i], valueB[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a, b)
+	}
+}
+
+type jsonDecimal struct {
+	negative bool
+	digits   string
+	power    *big.Int
+}
+
+func jsonNumbersEqual(a, b json.Number) bool {
+	decimalA, ok := parseJSONDecimal(a)
+	if !ok {
+		return false
+	}
+	decimalB, ok := parseJSONDecimal(b)
+	if !ok {
+		return false
+	}
+	if decimalA.digits == "" || decimalB.digits == "" {
+		return decimalA.digits == decimalB.digits
+	}
+	if decimalA.negative != decimalB.negative {
+		return false
+	}
+
+	orderA := decimalOrder(decimalA)
+	orderB := decimalOrder(decimalB)
+	if orderA.Cmp(orderB) != 0 {
+		return false
+	}
+
+	maxDigits := len(decimalA.digits)
+	if len(decimalB.digits) > maxDigits {
+		maxDigits = len(decimalB.digits)
+	}
+	for i := 0; i < maxDigits; i++ {
+		digitA, digitB := byte('0'), byte('0')
+		if i < len(decimalA.digits) {
+			digitA = decimalA.digits[i]
+		}
+		if i < len(decimalB.digits) {
+			digitB = decimalB.digits[i]
+		}
+		if digitA != digitB {
+			return false
+		}
+	}
+	return true
+}
+
+func parseJSONDecimal(number json.Number) (jsonDecimal, bool) {
+	raw := number.String()
+	negative := strings.HasPrefix(raw, "-")
+	if negative {
+		raw = raw[1:]
+	}
+
+	exponent := new(big.Int)
+	mantissa := raw
+	if exponentIndex := strings.IndexAny(raw, "eE"); exponentIndex >= 0 {
+		mantissa = raw[:exponentIndex]
+		exponentText := raw[exponentIndex+1:]
+		if strings.HasPrefix(exponentText, "+") {
+			exponentText = exponentText[1:]
+		}
+		if exponentText == "" {
+			return jsonDecimal{}, false
+		}
+		if _, ok := exponent.SetString(exponentText, 10); !ok {
+			return jsonDecimal{}, false
+		}
+	}
+
+	fractionalPart := ""
+	if dotIndex := strings.IndexByte(mantissa, '.'); dotIndex >= 0 {
+		fractionalPart = mantissa[dotIndex+1:]
+		mantissa = mantissa[:dotIndex] + fractionalPart
+	}
+
+	digits := strings.TrimLeft(mantissa, "0")
+	if digits == "" {
+		return jsonDecimal{}, true
+	}
+	trimmedDigits := strings.TrimRight(digits, "0")
+	trailingZeros := len(digits) - len(trimmedDigits)
+	power := new(big.Int).Sub(exponent, big.NewInt(int64(len(fractionalPart))))
+	power.Add(power, big.NewInt(int64(trailingZeros)))
+	return jsonDecimal{negative: negative, digits: trimmedDigits, power: power}, true
+}
+
+func decimalOrder(decimal jsonDecimal) *big.Int {
+	order := new(big.Int).Set(decimal.power)
+	return order.Add(order, big.NewInt(int64(len(decimal.digits))))
 }
 
 // scanBalancedObject returns the exclusive end index of a brace-balanced
@@ -573,53 +1027,73 @@ func (u *TokenUsage) Add(other TokenUsage) {
 	u.OutputTokens += other.OutputTokens
 	u.CacheReadTokens += other.CacheReadTokens
 	u.CacheCreationTokens += other.CacheCreationTokens
+	u.ReasoningTokens += other.ReasoningTokens
+	u.ReasoningReported = u.ReasoningReported || other.ReasoningReported
+	u.Reported = u.Reported || other.Reported
+	u.CacheCreationReported = u.CacheCreationReported || other.CacheCreationReported
 }
 
 // New creates an agent by name with the given binary path.
 // For native agents, extraArgs are user CLI flags from agent_args_override that
 // are injected into the underlying tool's argv ahead of no-mistakes' managed flags.
-// ACP agents ignore extraArgs; use NewWithOptions to provide registry overrides.
+// ACP agents and aliases ignore extraArgs; use NewWithOptions to provide
+// registry overrides and the harness-neutral model/effort Profile.
 func New(name types.AgentName, bin string, extraArgs []string) (Agent, error) {
 	return NewWithOptions(name, bin, extraArgs, Options{})
 }
 
 // NewWithOptions creates an agent by name with additional backend-specific options.
 func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts Options) (Agent, error) {
-	if target, ok := acpTarget(name); ok {
-		rawCommand := ""
-		if opts.ACPRegistryOverrides != nil {
-			rawCommand = opts.ACPRegistryOverrides[target]
-		}
-		return &acpxAgent{bin: bin, target: target, rawCommand: rawCommand}, nil
+	// Fail closed on a knob this harness cannot express. Config load performs
+	// the same check, but this is the funnel every caller reaches - including
+	// eval replay and programmatic callers that build a profile directly - so a
+	// run can never report a model or effort it did not actually use.
+	if err := agentcfg.Validate(name, opts.Profile); err != nil {
+		return nil, err
+	}
+	if target, ok := types.ACPTargetFor(name); ok {
+		rawCommand := types.ACPRawCommand(target, opts.ACPRegistryOverrides)
+		return &acpxAgent{bin: bin, target: target, rawCommand: rawCommand, model: opts.Profile.Model, subprocessContext: newSubprocessContext(opts.Environment)}, nil
+	}
+	// Mapped flags follow the operator's raw agent_args_override flags, so they
+	// still precede no-mistakes' managed flags in every adapter's argv. A knob
+	// the raw args already pin natively is not emitted at all (see agentcfg),
+	// which is what keeps pre-existing configurations byte-identical.
+	if mapped := agentcfg.NativeArgs(name, opts.Profile, extraArgs); len(mapped) > 0 {
+		merged := make([]string, 0, len(extraArgs)+len(mapped))
+		merged = append(merged, extraArgs...)
+		merged = append(merged, mapped...)
+		extraArgs = merged
 	}
 	switch name {
 	case types.AgentClaude:
-		return &claudeAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &claudeAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentCodex:
-		return &codexAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &codexAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, subprocessContext: newSubprocessContext(opts.Environment)}, nil
+	case types.AgentGrok:
+		a := &grokAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, subprocessContext: newSubprocessContext(opts.Environment)}
+		if opts.DisableProjectSettings {
+			a.supportsNoContextFiles = grokCLISupportsNoContextFiles(bin)
+		}
+		return a, nil
 	case types.AgentRovoDev:
-		return &rovodevAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &rovodevAgent{bin: bin, extraArgs: extraArgs, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentOpenCode:
-		return &opencodeAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &opencodeAgent{bin: bin, extraArgs: extraArgs, profile: opts.Profile, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	case types.AgentPi:
-		return &piAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &piAgent{
+			bin:                    bin,
+			extraArgs:              extraArgs,
+			disableProjectSettings: opts.DisableProjectSettings,
+			subprocessContext:      newSubprocessContext(opts.Environment),
+		}, nil
 	case types.AgentCopilot:
-		return &copilotAgent{bin: bin, extraArgs: extraArgs}, nil
+		return &copilotAgent{bin: bin, extraArgs: extraArgs, subprocessContext: newSubprocessContext(opts.Environment)}, nil
+	case types.AgentAntigravity:
+		return &antigravityAgent{bin: bin, extraArgs: extraArgs, subprocessContext: newSubprocessContext(opts.Environment)}, nil
 	default:
-		return nil, fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, rovodev, opencode, pi, copilot, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
+		return nil, fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, grok, rovodev, opencode, pi, copilot, cursor, antigravity, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
 	}
-}
-
-func acpTarget(name types.AgentName) (string, bool) {
-	value := string(name)
-	if !strings.HasPrefix(value, "acp:") {
-		return "", false
-	}
-	target := strings.TrimPrefix(value, "acp:")
-	if target == "" || strings.ContainsAny(target, " \t\r\n") {
-		return "", false
-	}
-	return target, true
 }
 
 // NewNoop returns an agent that does nothing. Used for demo mode where

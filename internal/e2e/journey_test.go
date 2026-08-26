@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"os"
@@ -44,12 +45,101 @@ import (
 func TestUserJourney(t *testing.T) {
 	// Subtests run sequentially: each one calls t.Setenv to point env
 	// vars at its own temp dirs, and t.Setenv is incompatible with
-	// t.Parallel. Three serial runs cost ~30s total on a warm cache.
-	for _, agentName := range []string{"claude", "codex", "opencode"} {
+	// t.Parallel. Keep the package timeout sized for all serial runs.
+	for _, agentName := range []string{"claude", "codex", "grok", "opencode", "antigravity"} {
 		agentName := agentName
 		t.Run(agentName, func(t *testing.T) {
 			runHappyPath(t, agentName)
 		})
+	}
+}
+
+func TestAXIControlByteFailureGateRemainsReadable(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: cleanReviewScenario(t)})
+	out, err := h.Run("init")
+	if err != nil {
+		t.Fatalf("nm init: %v\n%s", err, out)
+	}
+
+	failingCommand := filepath.Join(h.BinDir, "nm-control-byte-test-e2e")
+	script := "#!/bin/sh\nprintf 'bad\\037value\\n'\ni=0\nwhile [ \"$i\" -lt 45 ]; do printf 'later-%02d\\n' \"$i\"; i=$((i + 1)); done\nexit 1\n"
+	if err := os.WriteFile(failingCommand, []byte(script), 0o755); err != nil {
+		t.Fatalf("write control-byte test command: %v", err)
+	}
+	config := "ignore_patterns:\n  - '*.generated.go'\n  - 'vendor/**'\ncommands:\n  test: nm-control-byte-test-e2e\n  lint: true\n"
+	h.CommitChange("control-byte-test-gate", ".no-mistakes.yaml", config, "configure control-byte test failure")
+	h.PushToGate("control-byte-test-gate")
+	run := waitForStepStatus(t, h, "control-byte-test-gate", types.StepTest, types.StepStatusAwaitingApproval, 60*time.Second)
+
+	statusOut, err := h.Run("axi", "status", "--run", run.ID)
+	if err != nil {
+		t.Fatalf("axi status should render the Test gate: %v\n%s", err, statusOut)
+	}
+	for _, want := range []string{"gate:", "step: test", "status: awaiting_approval", `bad\\x1Fvalue`} {
+		if !strings.Contains(statusOut, want) {
+			t.Fatalf("axi status missing %q in:\n%s", want, statusOut)
+		}
+	}
+	if strings.ContainsRune(statusOut, '\x1f') {
+		t.Fatalf("axi status retained raw U+001F: %q", statusOut)
+	}
+
+	logsOut, err := h.Run("axi", "logs", "--run", run.ID, "--step", "test", "--full")
+	if err != nil {
+		t.Fatalf("axi logs --full should render the raw-evidence escape: %v\n%s", err, logsOut)
+	}
+	if !strings.Contains(logsOut, `bad\\x1Fvalue`) || !strings.Contains(logsOut, "later-44") {
+		t.Fatalf("full logs should include escaped early failure and late tail:\n%s", logsOut)
+	}
+	if strings.ContainsRune(logsOut, '\x1f') {
+		t.Fatalf("full logs retained raw U+001F: %q", logsOut)
+	}
+
+	logPath := filepath.Join(h.NMHome, "logs", run.ID, "test.log")
+	rawLog, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read durable test log: %v", err)
+	}
+	if !bytes.Contains(rawLog, []byte("bad\x1fvalue")) {
+		t.Fatal("durable Test log should preserve the raw control byte")
+	}
+	for _, stepName := range []types.StepName{types.StepDocument, types.StepLint, types.StepPush} {
+		step, ok := findStep(run.Steps, stepName)
+		if !ok || step.Status != types.StepStatusPending {
+			t.Fatalf("%s should remain pending at the readable Test gate, got %+v", stepName, step)
+		}
+	}
+}
+
+func TestAgentlessRunFailsBeforePipelineStarts(t *testing.T) {
+	h := NewHarness(t, SetupOpts{Agent: "claude", Scenario: cleanReviewScenario(t)})
+	for _, name := range []string{"claude", "codex", "grok", "opencode", "antigravity"} {
+		if err := os.Remove(filepath.Join(h.BinDir, name)); err != nil {
+			t.Fatalf("remove fake %s agent: %v", name, err)
+		}
+	}
+
+	out, err := h.Run("init")
+	if err != nil {
+		t.Fatalf("nm init: %v\n%s", err, out)
+	}
+	h.CommitChange("agentless", "agentless.txt", "agentless validation\n", "test agentless validation")
+	h.PushToGate("agentless")
+	run := h.WaitForRun("agentless", 60*time.Second)
+
+	if run.Status != types.RunFailed {
+		t.Fatalf("agentless run status = %s, want failed", run.Status)
+	}
+	if run.Error == nil {
+		t.Fatal("agentless run should explain why validation cannot start")
+	}
+	for _, want := range []string{"no runnable agent", "gate cannot validate"} {
+		if !strings.Contains(*run.Error, want) {
+			t.Errorf("agentless run error should contain %q, got %q", want, *run.Error)
+		}
+	}
+	if len(run.Steps) != 0 {
+		t.Fatalf("agentless run started %d pipeline steps, want fail-fast before steps: %+v", len(run.Steps), run.Steps)
 	}
 }
 
@@ -184,8 +274,8 @@ func runHappyPath(t *testing.T, agentName string) {
 	assertDocumentPrompt(t, h, run, invs)
 	assertDocumentStepNoGaps(t, run.Steps)
 	assertNoCommandTestStep(t, run.Steps, invs)
-	if !sawPromptContainingAll(invs, "Detect the linting and formatting tools", "branch: feature/e2e", "only unresolved") {
-		t.Errorf("expected a lint prompt with branch metadata and action guidance in invocations, got %d:\n%s", len(invs), summarisePrompts(invs))
+	if sawPromptContainingAll(invs, "Detect the linting and formatting tools", "branch: feature/e2e") {
+		t.Errorf("expected combined housekeeping to avoid a separate lint prompt, got %d:\n%s", len(invs), summarisePrompts(invs))
 	}
 	assertPromptsAbsent(t, invs,
 		"Draft a pull request title and summary for the full branch delta.",
@@ -350,11 +440,12 @@ func cleanReviewScenario(t *testing.T) string {
       summary: "no issues found"
       risk_level: low
       risk_rationale: "agent edit is deterministic"
+      risk_scope: source-or-external
       tested:
         - "fakeagent: simulated test run"
       testing_summary: "simulated tests passed"
       artifacts: []
-  - match: "You are validating a code change by testing it. Examine the repository and run the appropriate tests yourself.\n\nContext:\n- branch: test-agent-new-test-file"
+  - match: "You are validating a code change by testing it. Examine the repository and run the smallest relevant tests yourself.\n\nContext:\n- branch: test-agent-new-test-file"
     text: "tests passed after adding a regression test"
     edits:
       - path: "agent_test.py"
@@ -368,13 +459,13 @@ func cleanReviewScenario(t *testing.T) string {
         - "fakeagent: simulated test run"
       testing_summary: "simulated tests passed"
       artifacts: []
-  - match: "You are validating a code change by testing it. Examine the repository and run the appropriate tests yourself.\n\nContext:\n- branch: test-malformed-structured-output"
+  - match: "You are validating a code change by testing it. Examine the repository and run the smallest relevant tests yourself.\n\nContext:\n- branch: test-malformed-structured-output"
     text: "tests found some issues"
     structured_raw: '{"summary":123}'
   - match: "Detect the linting and formatting tools for this project, run the relevant checks yourself, apply safe fixes, and verify the result.\n\nContext:\n- branch: lint-malformed-structured-output"
     text: "lint found some issues"
     structured_raw: '{"summary":123}'
-  - match: "You are validating a code change by testing it. Examine the repository and run the appropriate tests yourself.\n\nContext:\n- branch: test-agent-staged-new-test-file"
+  - match: "You are validating a code change by testing it. Examine the repository and run the smallest relevant tests yourself.\n\nContext:\n- branch: test-agent-staged-new-test-file"
     text: "tests passed after staging a regression test"
     edits:
       - path: "agent_staged_test.go"
@@ -388,7 +479,7 @@ func cleanReviewScenario(t *testing.T) string {
         - "fakeagent: simulated test run"
       testing_summary: "simulated tests passed"
       artifacts: []
-  - match: "You are validating a code change by testing it. Examine the repository and run the appropriate tests yourself."
+  - match: "You are validating a code change by testing it. Examine the repository and run the smallest relevant tests yourself."
     text: "tests passed with no evidence artifacts"
     structured:
       findings: []
@@ -408,9 +499,11 @@ func cleanReviewScenario(t *testing.T) string {
           line: 1
           description: "looks good"
           action: no-op
+          review_scope: source
       summary: "no blocking issues"
       risk_level: low
       risk_rationale: "informational finding only"
+      risk_scope: source-or-external
       tested:
         - "fakeagent: simulated review"
       testing_summary: "not run during review"
@@ -424,9 +517,11 @@ func cleanReviewScenario(t *testing.T) string {
           line: 1
           description: "looks good"
           action: no-op
+          review_scope: source
       summary: "no blocking issues"
       risk_level: low
       risk_rationale: "informational finding only"
+      risk_scope: source-or-external
       tested:
         - "fakeagent: simulated review"
       testing_summary: "not run during review"
@@ -498,17 +593,28 @@ func assertDoctor(t *testing.T, h *Harness) {
 		"Agents",
 		"claude",
 		"codex",
+		"grok",
 		"rovodev",
 		"opencode",
 		"pi",
+		"antigravity",
 		"not found",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("doctor output should contain %q, got:\n%s", want, out)
 		}
 	}
-	for _, agentName := range []string{"claude", "codex", "opencode"} {
-		if !strings.Contains(out, filepath.Join(h.BinDir, agentName)) {
+	// Doctor reports each agent's probed binary path; antigravity probes
+	// the "agy" binary name rather than the agent name.
+	fakePaths := map[string]string{
+		"claude":      "claude",
+		"codex":       "codex",
+		"grok":        "grok",
+		"opencode":    "opencode",
+		"antigravity": "agy",
+	}
+	for agentName, binName := range fakePaths {
+		if !strings.Contains(out, filepath.Join(h.BinDir, binName)) {
 			t.Errorf("doctor output should report fake %s path, got:\n%s", agentName, out)
 		}
 	}
@@ -953,7 +1059,7 @@ func assertEmptyDiffAfterRebaseRun(t *testing.T, h *Harness) {
 	if sawPromptContainingAll(invs, "You are validating a code change by testing it", "branch: empty-after-rebase") {
 		t.Fatal("empty-after-rebase run should skip test without calling the agent")
 	}
-	if sawPromptContainingAll(invs, "Find every documentation gap", "branch: empty-after-rebase") {
+	if sawPromptContainingAll(invs, "Find what this change made stale", "branch: empty-after-rebase") {
 		t.Fatal("empty-after-rebase run should skip document without calling the agent")
 	}
 	if sawPromptContainingAll(invs, "Detect the linting and formatting tools", "branch: empty-after-rebase") {
@@ -1199,7 +1305,7 @@ func assertIgnoredOnlyRun(t *testing.T, h *Harness) {
 	if sawPromptContainingAll(invs, "Review the code changes", "branch: ignored-only") {
 		t.Fatal("ignored-only review should not call the agent")
 	}
-	if sawPromptContainingAll(invs, "Find every documentation gap", "branch: ignored-only") {
+	if sawPromptContainingAll(invs, "Find what this change made stale", "branch: ignored-only") {
 		t.Fatal("ignored-only document step should not call the agent")
 	}
 }
@@ -1539,7 +1645,7 @@ func assertExplicitAttachUsesRepoWideActiveRun(t *testing.T, h *Harness) {
 	t.Helper()
 	config := "ignore_patterns:\n  - '*.generated.go'\n  - 'vendor/**'\ncommands:\n  test: nm-explicit-attach-slow-e2e\n  lint: true\n"
 	slowCommand := filepath.Join(h.BinDir, "nm-explicit-attach-slow-e2e")
-	if err := os.WriteFile(slowCommand, []byte("#!/bin/sh\nsleep 10\n"), 0o755); err != nil {
+	if err := os.WriteFile(slowCommand, []byte("#!/bin/sh\nsleep 60\n"), 0o755); err != nil {
 		t.Fatalf("write explicit attach slow test command: %v", err)
 	}
 	h.CommitChange("explicit-attach-active", ".no-mistakes.yaml", config, "configure explicit attach slow test")
@@ -1593,7 +1699,7 @@ func assertTestMalformedStructuredOutputRun(t *testing.T, h *Harness) {
 
 func assertLintMalformedStructuredOutputRun(t *testing.T, h *Harness) {
 	t.Helper()
-	h.CommitChange("lint-malformed-structured-output", "lint-malformed-structured-output.txt", "lint malformed structured output\n", "add lint malformed structured output")
+	h.CommitChange("lint-malformed-structured-output", "lint-malformed-structured-output.generated.go", "lint malformed structured output\n", "add lint malformed structured output")
 	h.PushToGate("lint-malformed-structured-output")
 	run := h.WaitForRun("lint-malformed-structured-output", 60*time.Second)
 	if run.Status != types.RunCompleted {
@@ -1687,10 +1793,19 @@ func assertTestAgentNewTestFileRun(t *testing.T, h *Harness) {
 	t.Helper()
 	h.CommitChange("test-agent-new-test-file", "test-agent-new-test-file.txt", "test agent new test file\n", "add test agent new test file")
 	h.PushToGate("test-agent-new-test-file")
-	run := waitForStepStatus(t, h, "test-agent-new-test-file", types.StepTest, types.StepStatusAwaitingApproval, 10*time.Second)
+	// Issue #140: a passing test run whose only finding is an informational
+	// "new test file written by agent" note must not gate on approval; the run
+	// proceeds automatically to completion.
+	run := h.WaitForRun("test-agent-new-test-file", 60*time.Second)
+	if run.Status != types.RunCompleted {
+		t.Fatalf("test-agent-new-test-file run status = %s, want completed; error=%v", run.Status, deref(run.Error))
+	}
 	testStep, ok := findStep(run.Steps, types.StepTest)
 	if !ok {
 		t.Fatal("expected test step in test-agent-new-test-file run")
+	}
+	if testStep.Status != types.StepStatusCompleted {
+		t.Fatalf("test step status = %s, want completed", testStep.Status)
 	}
 	if testStep.FindingsJSON == nil {
 		t.Fatal("expected test step to record findings JSON for new test file")
@@ -1706,16 +1821,14 @@ func assertTestAgentNewTestFileRun(t *testing.T, h *Harness) {
 	if item.Severity != "info" {
 		t.Fatalf("new test file finding severity = %q, want info", item.Severity)
 	}
+	if item.Action != types.ActionNoOp {
+		t.Fatalf("new test file finding action = %q, want no-op", item.Action)
+	}
 	if item.File != "agent_test.py" {
 		t.Fatalf("new test file finding file = %q, want agent_test.py", item.File)
 	}
 	if !strings.Contains(item.Description, "new test file written by agent: agent_test.py") {
 		t.Fatalf("new test file finding description = %q", item.Description)
-	}
-	h.Respond(run.ID, types.StepTest, types.ActionAbort)
-	completed := h.WaitForRun("test-agent-new-test-file", 60*time.Second)
-	if completed.Status != types.RunFailed {
-		t.Fatalf("test-agent-new-test-file run status after abort = %s, want failed", completed.Status)
 	}
 }
 
@@ -1723,10 +1836,18 @@ func assertTestAgentStagedNewTestFileRun(t *testing.T, h *Harness) {
 	t.Helper()
 	h.CommitChange("test-agent-staged-new-test-file", "test-agent-staged-new-test-file.txt", "test agent staged new test file\n", "add test agent staged new test file")
 	h.PushToGate("test-agent-staged-new-test-file")
-	run := waitForStepStatus(t, h, "test-agent-staged-new-test-file", types.StepTest, types.StepStatusAwaitingApproval, 10*time.Second)
+	// Issue #140: same as the untracked case, but the agent stages the new test
+	// file. It is still purely informational, so the run proceeds automatically.
+	run := h.WaitForRun("test-agent-staged-new-test-file", 60*time.Second)
+	if run.Status != types.RunCompleted {
+		t.Fatalf("test-agent-staged-new-test-file run status = %s, want completed; error=%v", run.Status, deref(run.Error))
+	}
 	testStep, ok := findStep(run.Steps, types.StepTest)
 	if !ok {
 		t.Fatal("expected test step in test-agent-staged-new-test-file run")
+	}
+	if testStep.Status != types.StepStatusCompleted {
+		t.Fatalf("test step status = %s, want completed", testStep.Status)
 	}
 	if testStep.FindingsJSON == nil {
 		t.Fatal("expected test step to record findings JSON for staged new test file")
@@ -1742,16 +1863,14 @@ func assertTestAgentStagedNewTestFileRun(t *testing.T, h *Harness) {
 	if item.Severity != "info" {
 		t.Fatalf("staged new test file finding severity = %q, want info", item.Severity)
 	}
+	if item.Action != types.ActionNoOp {
+		t.Fatalf("staged new test file finding action = %q, want no-op", item.Action)
+	}
 	if item.File != "agent_staged_test.go" {
 		t.Fatalf("staged new test file finding file = %q, want agent_staged_test.go", item.File)
 	}
 	if !strings.Contains(item.Description, "new test file written by agent: agent_staged_test.go") {
 		t.Fatalf("staged new test file finding description = %q", item.Description)
-	}
-	h.Respond(run.ID, types.StepTest, types.ActionAbort)
-	completed := h.WaitForRun("test-agent-staged-new-test-file", 60*time.Second)
-	if completed.Status != types.RunFailed {
-		t.Fatalf("test-agent-staged-new-test-file run status after abort = %s, want failed", completed.Status)
 	}
 }
 
@@ -1886,7 +2005,10 @@ func waitForStepStatus(t *testing.T, h *Harness, branch string, stepName types.S
 func assertSupersededRunCancellation(t *testing.T, h *Harness) {
 	t.Helper()
 	slowCommand := filepath.Join(h.BinDir, "nm-superseded-test-e2e")
-	if err := os.WriteFile(slowCommand, []byte("#!/bin/sh\nsleep 10\n"), 0o755); err != nil {
+	// Keep the first run deterministically active even when the full e2e suite
+	// is CPU-saturated. Cancellation reaps the process group, so this does not
+	// add wall time on the passing path.
+	if err := os.WriteFile(slowCommand, []byte("#!/bin/sh\nsleep 120\n"), 0o755); err != nil {
 		t.Fatalf("write superseded slow test command: %v", err)
 	}
 	config := "ignore_patterns:\n  - '*.generated.go'\n  - 'vendor/**'\ncommands:\n  test: nm-superseded-test-e2e\n  lint: true\n"
@@ -2663,7 +2785,7 @@ func assertReviewStepInfoOnly(t *testing.T, steps []ipc.StepResultInfo) {
 
 func assertDocumentPrompt(t *testing.T, h *Harness, run *ipc.RunInfo, invs []Invocation) {
 	t.Helper()
-	prompt, ok := promptContainingAll(invs, "Find every documentation gap", "branch: feature/e2e")
+	prompt, ok := promptContainingAll(invs, "Find what this change made stale", "branch: feature/e2e")
 	if !ok {
 		t.Fatalf("expected a feature/e2e document prompt in invocations, got %d:\n%s", len(invs), summarisePrompts(invs))
 	}
@@ -2673,12 +2795,25 @@ func assertDocumentPrompt(t *testing.T, h *Harness, run *ipc.RunInfo, invs []Inv
 		baseSHA,
 		run.HeadSHA,
 		"ignore patterns: *.generated.go, vendor/**",
+		"Documentation placement policy",
+		"one authoritative owner document",
+		"Only touch documentation this change made stale",
+		"Do not create a new documentation surface merely to close a perceived gap.",
+		"Combined lint duty (same pass - no separate lint agent will run):",
+		`"category" set to "lint"`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("expected document prompt to contain %q, got:\n%s", want, prompt)
+		}
+	}
+	for _, unexpected := range []string{
+		"Find every documentation gap",
 		"Be exhaustive.",
 		"fix all of them yourself",
 		"Do not stop after the first documentation gap.",
 	} {
-		if !strings.Contains(prompt, want) {
-			t.Errorf("expected document prompt to contain %q, got:\n%s", want, prompt)
+		if strings.Contains(prompt, unexpected) {
+			t.Errorf("expected document prompt to exclude %q, got:\n%s", unexpected, prompt)
 		}
 	}
 }

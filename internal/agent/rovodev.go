@@ -17,11 +17,14 @@ import (
 type rovodevAgent struct {
 	bin       string
 	extraArgs []string
-	mu        sync.Mutex
-	server    *managedServer
+	subprocessContext
+	mu     sync.Mutex
+	server *managedServer
 }
 
 func (a *rovodevAgent) Name() string { return "rovodev" }
+
+func (a *rovodevAgent) ReportsAgentAttempts() bool { return true }
 
 func (a *rovodevAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
 	return runWithRetry(ctx, "rovodev", opts, claudeMaxRetries, classifyTransient, a.recoverTransientRetry, func() (*Result, error) {
@@ -44,7 +47,7 @@ func (a *rovodevAgent) recoverTransientRetry(label string) {
 
 func (a *rovodevAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) {
 	// Start server on first invocation (synchronized)
-	baseURL, err := a.ensureServer(ctx, opts.CWD)
+	baseURL, err := a.ensureServer(ctx, opts.CWD, opts.Env)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +84,7 @@ func (a *rovodevAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, erro
 	return finalizeTextResult("rovodev", text, opts.JSONSchema, usage)
 }
 
-func (a *rovodevAgent) ensureServer(ctx context.Context, cwd string) (string, error) {
+func (a *rovodevAgent) ensureServer(ctx context.Context, cwd string, env []string) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.server != nil {
@@ -92,7 +95,7 @@ func (a *rovodevAgent) ensureServer(ctx context.Context, cwd string) (string, er
 		return "", fmt.Errorf("rovodev port: %w", err)
 	}
 	args := buildRovodevServeArgs(a.extraArgs, port)
-	srv, err := startServerWithPort(ctx, "rovodev", a.bin, args, cwd, "/healthcheck", port)
+	srv, err := startServerWithPort(ctx, "rovodev", a.bin, args, cwd, "/healthcheck", port, a.overlay(), env)
 	if err != nil {
 		return "", fmt.Errorf("rovodev server: %w", err)
 	}
@@ -296,10 +299,12 @@ func parseRovodevSSE(r io.Reader, onChunk func(string), usage *TokenUsage, lates
 		switch kind {
 		case "request-usage":
 			usage.Add(TokenUsage{
-				InputTokens:         payload.InputTokens,
-				OutputTokens:        payload.OutputTokens,
-				CacheReadTokens:     payload.CacheReadTokens,
-				CacheCreationTokens: payload.CacheWriteTokens,
+				InputTokens:           payload.InputTokens,
+				OutputTokens:          payload.OutputTokens,
+				CacheReadTokens:       payload.CacheReadTokens,
+				CacheCreationTokens:   payload.CacheWriteTokens,
+				Reported:              true,
+				CacheCreationReported: true,
 			})
 
 		case "text":
